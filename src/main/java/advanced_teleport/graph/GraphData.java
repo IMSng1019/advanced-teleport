@@ -49,11 +49,22 @@ public final class GraphData {
         }
     }
 
-    public record PortalLink(String id, Point first, Point second, boolean protectedEntry) {
+    /** Each endpoint is an axis-aligned portal rectangle; legacy point endpoints remain valid. */
+    public record PortalLink(String id, Point first, Point second, boolean protectedEntry,
+                             Point firstExtent, Point secondExtent) {
+        public PortalLink(String id, Point first, Point second, boolean protectedEntry) {
+            this(id, first, second, protectedEntry, first, second);
+        }
+
         public PortalLink {
             id = requireText(id, "portal id");
             Objects.requireNonNull(first, "first portal endpoint");
             Objects.requireNonNull(second, "second portal endpoint");
+            // Older cache JSON omits extents. Preserve its point geometry during migration.
+            firstExtent = firstExtent == null ? first : firstExtent;
+            secondExtent = secondExtent == null ? second : secondExtent;
+            requirePortalRectangle(first, firstExtent);
+            requirePortalRectangle(second, secondExtent);
         }
     }
 
@@ -74,6 +85,13 @@ public final class GraphData {
         if (value == null || value.isBlank() || value.length() > 256)
             throw new IllegalArgumentException(description + " must contain 1-256 characters");
         return value;
+    }
+
+    private static void requirePortalRectangle(Point start, Point extent) {
+        if (!start.dimension().equals(extent.dimension()))
+            throw new IllegalArgumentException("A portal surface must stay within one dimension");
+        if (start.x() != extent.x() && start.y() != extent.y() && start.z() != extent.z())
+            throw new IllegalArgumentException("A portal surface must be an axis-aligned rectangle");
     }
 
     private static List<Point> checkedPoints(List<Point> values, String dimension, int minimum) {

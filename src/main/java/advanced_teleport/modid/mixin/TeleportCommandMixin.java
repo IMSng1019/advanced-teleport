@@ -31,7 +31,7 @@ public abstract class TeleportCommandMixin {
                                   CallbackInfoReturnable<Integer> cir) throws CommandSyntaxException {
         AtpServer service = AtpServer.get(source.getServer());
         if (service != null && service.restricts(source)) {
-            service.request(source, targets, AtpServer.point(destination));
+            service.request(source, targets, AtpServer.point(destination), destination.getYaw(), destination.getPitch(), null);
             cir.setReturnValue(1);
         }
     }
@@ -44,7 +44,11 @@ public abstract class TeleportCommandMixin {
         AtpServer service = AtpServer.get(source.getServer());
         if (service != null && service.restricts(source)) {
             var p = location.toAbsolutePos(source);
-            service.request(source, targets, new Point(world.getRegistryKey().getValue().toString(), p.x, p.y, p.z));
+            var player=source.getPlayerOrThrow();
+            var angles=rotation==null?null:rotation.toAbsoluteRotation(source);
+            service.request(source, targets, new Point(world.getRegistryKey().getValue().toString(), p.x, p.y, p.z),
+                    angles==null?player.getYaw():angles.y, angles==null?player.getPitch():angles.x,
+                    lookTarget==null?null:entity->((TeleportLookTargetInvoker)lookTarget).atp$look(source,entity));
             cir.setReturnValue(1);
         }
     }

@@ -5,6 +5,8 @@ import advanced_teleport.graph.GraphData.Point;
 import advanced_teleport.graph.GraphData.Road;
 
 import java.util.List;
+import java.util.ArrayList;
+import java.util.Collections;
 
 /** Geometry uses X/Z city footprints and true 3D road distances. */
 public final class Geometry {
@@ -23,6 +25,72 @@ public final class Geometry {
         double length=dx*dx+dy*dy+dz*dz;
         double t=length <= EPS*EPS ? 0 : clamp(((point.x()-a.x())*dx+(point.y()-a.y())*dy+(point.z()-a.z())*dz)/length);
         return new Point(a.dimension(), a.x()+t*dx, a.y()+t*dy, a.z()+t*dz);
+    }
+
+    /** Closest point on an axis-aligned rectangle (including degenerate lines and points). */
+    public static Point closestOnRectangle(Point point, Point cornerA, Point cornerB) {
+        requireSameDimension(point,cornerA);
+        requireRectangle(cornerA,cornerB);
+        return new Point(point.dimension(),
+                clamp(point.x(),Math.min(cornerA.x(),cornerB.x()),Math.max(cornerA.x(),cornerB.x())),
+                clamp(point.y(),Math.min(cornerA.y(),cornerB.y()),Math.max(cornerA.y(),cornerB.y())),
+                clamp(point.z(),Math.min(cornerA.z(),cornerB.z()),Math.max(cornerA.z(),cornerB.z())));
+    }
+
+    /** Exact distance to a rectangular portal face, not its diagonal or boundary alone. */
+    public static double segmentRectangleDistanceSquared(Point a,Point b,Point cornerA,Point cornerB) {
+        requireSameDimension(a,b);
+        requireRectangle(cornerA,cornerB);
+        if(!a.dimension().equals(cornerA.dimension()))return Double.POSITIVE_INFINITY;
+        double[] start={a.x(),a.y(),a.z()},delta={b.x()-a.x(),b.y()-a.y(),b.z()-a.z()};
+        double[] minimum={Math.min(cornerA.x(),cornerB.x()),Math.min(cornerA.y(),cornerB.y()),Math.min(cornerA.z(),cornerB.z())};
+        double[] maximum={Math.max(cornerA.x(),cornerB.x()),Math.max(cornerA.y(),cornerB.y()),Math.max(cornerA.z(),cornerB.z())};
+        var cuts=new ArrayList<Double>();cuts.add(0d);cuts.add(1d);
+        for(int axis=0;axis<3;axis++)if(delta[axis]!=0) {
+            for(double bound:new double[]{minimum[axis],maximum[axis]}) {
+                double t=(bound-start[axis])/delta[axis];
+                if(t>0&&t<1)cuts.add(t);
+            }
+        }
+        Collections.sort(cuts);
+        double best=Double.POSITIVE_INFINITY;
+        // Point-to-box squared distance is quadratic between crossings of its coordinate bounds.
+        // The portal is a flat box, so minimizing each interval also handles face intersections.
+        for(int i=1;i<cuts.size();i++) {
+            double low=cuts.get(i-1),high=cuts.get(i),middle=(low+high)/2;
+            double quadratic=0,linear=0;
+            for(int axis=0;axis<3;axis++) {
+                double coordinate=start[axis]+delta[axis]*middle;
+                double bound=coordinate<minimum[axis]?minimum[axis]:maximum[axis];
+                if(coordinate<minimum[axis]||coordinate>maximum[axis]) {
+                    quadratic+=delta[axis]*delta[axis];
+                    linear+=delta[axis]*(start[axis]-bound);
+                }
+            }
+            double t=quadratic==0?low:clamp(-linear/quadratic,low,high);
+            Point candidate=new Point(a.dimension(),a.x()+t*delta[0],a.y()+t*delta[1],a.z()+t*delta[2]);
+            best=Math.min(best,distanceSquared(candidate,closestOnRectangle(candidate,cornerA,cornerB)));
+        }
+        return best;
+    }
+
+    /** Minimum Euclidean distance between two axis-aligned portal rectangles. */
+    public static double rectangleDistanceSquared(Point a,Point extentA,Point b,Point extentB) {
+        requireRectangle(a,extentA);requireRectangle(b,extentB);
+        if(!a.dimension().equals(b.dimension()))return Double.POSITIVE_INFINITY;
+        return square(intervalGap(a.x(),extentA.x(),b.x(),extentB.x()))
+                +square(intervalGap(a.y(),extentA.y(),b.y(),extentB.y()))
+                +square(intervalGap(a.z(),extentA.z(),b.z(),extentB.z()));
+    }
+
+    private static double intervalGap(double a,double extentA,double b,double extentB) {
+        return Math.max(0,Math.max(Math.min(a,extentA)-Math.max(b,extentB),Math.min(b,extentB)-Math.max(a,extentA)));
+    }
+
+    private static void requireRectangle(Point a,Point extent) {
+        requireSameDimension(a,extent);
+        if(a.x()!=extent.x()&&a.y()!=extent.y()&&a.z()!=extent.z())
+            throw new IllegalArgumentException("Expected an axis-aligned rectangle");
     }
 
     public static Point closestOnRoad(Point point, Road road) {
@@ -150,6 +218,7 @@ public final class Geometry {
     }
     private static double orientation(Point a,Point b,Point c) { return (b.x()-a.x())*(c.z()-a.z())-(b.z()-a.z())*(c.x()-a.x()); }
     private static double clamp(double t) { return Math.max(0,Math.min(1,t)); }
+    private static double clamp(double value,double minimum,double maximum) {return Math.max(minimum,Math.min(maximum,value));}
     private static double square(double x) { return x*x; }
     private static void requireSameDimension(Point a,Point b) {
         if (!a.dimension().equals(b.dimension())) throw new IllegalArgumentException("Geometry dimensions differ");

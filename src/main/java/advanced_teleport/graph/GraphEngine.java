@@ -13,6 +13,12 @@ public final class GraphEngine {
     private final UnionFind components;
     private final Bounds[] cityBounds;
     private final Bounds[] roadBounds;
+    private final Map<String,PortalAttachment> portalAttachments=new HashMap<>();
+    private static final Comparator<Station> STATION_ORDER=Comparator
+            .comparing((Station station)->station.position().dimension())
+            .thenComparingDouble(station->station.position().x())
+            .thenComparingDouble(station->station.position().y())
+            .thenComparingDouble(station->station.position().z()).thenComparing(Station::id);
 
     public GraphEngine(Snapshot snapshot, GraphSettings settings) {
         this.snapshot=Objects.requireNonNull(snapshot);
@@ -25,7 +31,7 @@ public final class GraphEngine {
         RoadIndex index=connectRoads();
         connectPortals(index);
         validStations=snapshot.stations().stream().filter(this::isStationOnRoad)
-                .sorted(Comparator.comparing(Station::id)).toList();
+                .sorted(STATION_ORDER).toList();
     }
 
     public Optional<Point> resolve(Point source, Point target, boolean strict) {
@@ -43,26 +49,60 @@ public final class GraphEngine {
         return index != null && Geometry.distanceToRoadSquared(station.position(),snapshot.roads().get(index)) <= .01+EPS;
     }
 
+    /** Immutable geometry views for checking whether a pending local edit can affect this journey. */
+    public List<Road> reachableRoads(Point source,boolean strict) {
+        Set<Integer> roots=sourceComponents(source,strict);
+        var result=new ArrayList<Road>();
+        for(int i=0;i<snapshot.roads().size();i++)if(roots.contains(roadComponent(i)))result.add(snapshot.roads().get(i));
+        return List.copyOf(result);
+    }
+
+    public List<City> reachableCities(Point source,boolean strict) {
+        Set<Integer> roots=sourceComponents(source,strict);
+        var result=new ArrayList<City>();
+        for(int i=0;i<snapshot.cities().size();i++)if(roots.contains(components.find(i)))result.add(snapshot.cities().get(i));
+        return List.copyOf(result);
+    }
+
+    public List<PortalLink> reachablePortals(Point source,boolean strict) {
+        Set<Integer> roots=sourceComponents(source,strict);
+        return snapshot.portals().stream().filter(portal->{
+            PortalAttachment attachment=portalAttachments.get(portal.id());
+            return attachment!=null && attachment.roadNodes().stream().anyMatch(node->roots.contains(components.find(node)));
+        }).toList();
+    }
+
+    private Set<Integer> sourceComponents(Point source,boolean strict) {
+        return strict?stationComponentsAt(source):componentsAt(source);
+    }
+
     private Optional<Point> resolveStrict(Set<Integer> sourceComponents, Point target) {
         Set<Integer> targetComponents=componentsAt(target);
         if (targetComponents.isEmpty()) return Optional.empty();
         Station best=null;
         double bestRegionDistance=Double.POSITIVE_INFINITY,bestTargetDistance=Double.POSITIVE_INFINITY;
+        Map<Integer,PortalDistances> routes=new HashMap<>();
         for (Station station:validStations) {
-            if (!sourceComponents.contains(roadComponent(roadIndices.get(station.roadId())))) continue;
+            int component=roadComponent(roadIndices.get(station.roadId()));
+            if (!sourceComponents.contains(component)) continue;
             // Euclidean distance is meaningful only within one dimension. Portal links can make
             // target-component geometry available in the station's dimension; otherwise exclude it.
             Optional<Point> nearest=targetComponents.contains(roadComponent(roadIndices.get(station.roadId())))
                     ? Optional.of(station.position()) : closestInComponents(station.position(),targetComponents);
             if (nearest.isEmpty()) continue;
             double regionDistance=Geometry.distanceSquared(station.position(),nearest.get());
-            double targetDistance=Geometry.distanceSquared(station.position(),target);
+            double targetDistance=routes.computeIfAbsent(component,root->new PortalDistances(root,target)).from(station.position());
             if (best==null || regionDistance<bestRegionDistance-EPS ||
-                    (Math.abs(regionDistance-bestRegionDistance)<=EPS && targetDistance<bestTargetDistance-EPS)) {
+                    (sameDistance(regionDistance,bestRegionDistance) && (targetDistance<bestTargetDistance-EPS
+                            || sameDistance(targetDistance,bestTargetDistance)&&STATION_ORDER.compare(station,best)<0))) {
                 best=station;bestRegionDistance=regionDistance;bestTargetDistance=targetDistance;
             }
         }
         return best==null ? Optional.empty() : Optional.of(best.position());
+    }
+
+    private static boolean sameDistance(double a,double b) {
+        return Double.compare(a,b)==0||Math.abs(a-b)<=EPS;
     }
 
     private Optional<Point> closestInComponents(Point target, Set<Integer> roots) {
@@ -145,14 +185,80 @@ public final class GraphEngine {
         double distance=settings.portalConnectionDistance();
         for (PortalLink portal:snapshot.portals()) {
             int firstNode=-1;
-            for (Point endpoint:List.of(portal.first(),portal.second())) {
-                for (Segment segment:index.query(Bounds.at(endpoint).expanded(distance),endpoint.dimension())) {
-                    if (Geometry.distanceSquared(endpoint,Geometry.closestOnSegment(endpoint,segment.a(),segment.b()))>distance*distance+EPS) continue;
+            var firstRoads=new HashSet<Integer>();var secondRoads=new HashSet<Integer>();
+            List<Surface> surfaces=List.of(new Surface(portal.first(),portal.firstExtent()),new Surface(portal.second(),portal.secondExtent()));
+            for (int endpoint=0;endpoint<2;endpoint++) {
+                Surface surface=surfaces.get(endpoint);
+                Set<Integer> attachment=endpoint==0?firstRoads:secondRoads;
+                for (Segment segment:index.query(Bounds.of(List.of(surface.anchor(),surface.extent())).expanded(distance),surface.anchor().dimension())) {
+                    if (Geometry.segmentRectangleDistanceSquared(segment.a(),segment.b(),surface.anchor(),surface.extent())>distance*distance+EPS) continue;
                     int node=roadNode(segment.road());
+                    attachment.add(node);
                     if (firstNode<0) firstNode=node;
                     else components.union(firstNode,node);
                 }
             }
+            portalAttachments.put(portal.id(),new PortalAttachment(Set.copyOf(firstRoads),Set.copyOf(secondRoads)));
+        }
+    }
+
+    private record PortalAttachment(Set<Integer> first,Set<Integer> second) {
+        Set<Integer> roadNodes() {var nodes=new HashSet<>(first);nodes.addAll(second);return nodes;}
+        boolean spansComponent(int root,UnionFind components) {
+            return first.stream().anyMatch(node->components.find(node)==root)
+                    &&second.stream().anyMatch(node->components.find(node)==root);
+        }
+    }
+
+    private record Surface(Point anchor,Point extent) {
+        double distance(Point point) {
+            if(!point.dimension().equals(anchor.dimension()))return Double.POSITIVE_INFINITY;
+            return Math.sqrt(Geometry.distanceSquared(point,Geometry.closestOnRectangle(point,anchor,extent)));
+        }
+        double distance(Surface other) {
+            return Math.sqrt(Geometry.rectangleDistanceSquared(anchor,extent,other.anchor,other.extent));
+        }
+    }
+
+    /**
+     * A geometric cross-dimension tie metric: straight-line distances within each dimension,
+     * portal surfaces as transit zones, and zero cost for crossing a registered paired portal.
+     * It is deliberately not rail travel time; primary strict-mode ordering remains distance
+     * to the destination component. Only portal pairs served by this component may be used.
+     */
+    private final class PortalDistances {
+        private final Point target;
+        private final List<Surface> surfaces=new ArrayList<>();
+        private final double[] distance;
+
+        PortalDistances(int component,Point target) {
+            this.target=target;
+            for(PortalLink portal:snapshot.portals()) {
+                PortalAttachment attachment=portalAttachments.get(portal.id());
+                if(attachment==null||!attachment.spansComponent(component,components))continue;
+                surfaces.add(new Surface(portal.first(),portal.firstExtent()));
+                surfaces.add(new Surface(portal.second(),portal.secondExtent()));
+            }
+            distance=new double[surfaces.size()];
+            boolean[] settled=new boolean[surfaces.size()];
+            for(int i=0;i<distance.length;i++)distance[i]=surfaces.get(i).distance(target);
+            for(int step=0;step<distance.length;step++) {
+                int nearest=-1;
+                for(int i=0;i<distance.length;i++)
+                    if(!settled[i]&&(nearest<0||distance[i]<distance[nearest]))nearest=i;
+                if(nearest<0||!Double.isFinite(distance[nearest]))break;
+                settled[nearest]=true;
+                for(int i=0;i<distance.length;i++)if(!settled[i]) {
+                    double cost=i==(nearest^1)?0:surfaces.get(nearest).distance(surfaces.get(i));
+                    distance[i]=Math.min(distance[i],distance[nearest]+cost);
+                }
+            }
+        }
+
+        double from(Point station) {
+            double best=Math.sqrt(Geometry.distanceSquared(station,target));
+            for(int i=0;i<surfaces.size();i++)best=Math.min(best,surfaces.get(i).distance(station)+distance[i]);
+            return best;
         }
     }
 

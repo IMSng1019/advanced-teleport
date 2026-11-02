@@ -78,7 +78,9 @@ public final class AdvancedTeleportGameTests implements FabricGameTest {
             throw failure;
         }
 
-        context.runAtTick(30,()->{
+        long expectedRevision=service.snapshot().revision();
+        context.addInstantFinalTask(()->{
+            context.assertTrue(service.persistedRevision()>=expectedRevision,"Waiting for background SQLite persistence");
             try(GraphStore persisted=new GraphStore(database)) {
                 Snapshot saved=persisted.load();
                 context.assertTrue(saved.roads().stream().anyMatch(r->r.id().equals(prefix+"road")&&r.protectedEntry()),
@@ -184,10 +186,14 @@ public final class AdvancedTeleportGameTests implements FabricGameTest {
         ServerWorld overworld=server.getWorld(World.OVERWORLD),nether=server.getWorld(World.NETHER);
         context.assertTrue(service!=null&&overworld!=null&&nether!=null,"Portal test requires ATP and both vanilla dimensions");
         BlockPos sourceFrame=new BlockPos(1000,100,1000),destinationFrame=new BlockPos(125,100,125);
-        overworld.getChunk(sourceFrame);
-        nether.getChunk(destinationFrame);
+        forceFrame(overworld,sourceFrame,true);
+        forceFrame(nether,destinationFrame,true);
         clearFrame(overworld,sourceFrame);
         clearFrame(nether,destinationFrame);
+        Runnable portalCleanup=()->{
+            clearFrame(overworld,sourceFrame);clearFrame(nether,destinationFrame);
+            forceFrame(overworld,sourceFrame,false);forceFrame(nether,destinationFrame,false);
+        };
         // These coordinates are fixed to exercise the vanilla 8:1 dimension scaling. Remove
         // leftovers from a previously failed harness run before testing fresh activation.
         for(PortalLink link:List.copyOf(service.snapshot().portals()))
@@ -199,7 +205,7 @@ public final class AdvancedTeleportGameTests implements FabricGameTest {
                 activateFrame(overworld,sourceFrame);
                 activateFrame(nether,destinationFrame);
             } catch(RuntimeException | Error failure) {
-                clearFrame(overworld,sourceFrame);clearFrame(nether,destinationFrame);
+                portalCleanup.run();
                 throw failure;
             }
         });
@@ -213,7 +219,7 @@ public final class AdvancedTeleportGameTests implements FabricGameTest {
                 for(int x=1;x<=2;x++)for(int y=1;y<=3;y++)
                     overworld.setBlockState(sourceFrame.add(x,y,0),Blocks.AIR.getDefaultState(),3);
             } catch(RuntimeException | Error failure) {
-                clearFrame(overworld,sourceFrame);clearFrame(nether,destinationFrame);
+                portalCleanup.run();
                 throw failure;
             }
         });
@@ -222,7 +228,7 @@ public final class AdvancedTeleportGameTests implements FabricGameTest {
                 context.assertTrue(service.snapshot().portals().stream().noneMatch(p->paired.contains(p.id())),
                         "Destroying the real source portal did not remove its automatic cross-dimension link");
             } finally {
-                clearFrame(overworld,sourceFrame);clearFrame(nether,destinationFrame);
+                portalCleanup.run();
             }
             context.complete();
         });
@@ -241,8 +247,12 @@ public final class AdvancedTeleportGameTests implements FabricGameTest {
         Runnable cleanup=()->{
             clearFrame(overworld,a);clearFrame(overworld,d);
             clearFrame(nether,b);clearFrame(nether,c);
+            forceFrame(overworld,a,false);forceFrame(overworld,d,false);
+            forceFrame(nether,b,false);forceFrame(nether,c,false);
         };
         cleanup.run();
+        forceFrame(overworld,a,true);forceFrame(overworld,d,true);
+        forceFrame(nether,b,true);forceFrame(nether,c,true);
         Set<String> historical=new HashSet<>();
         context.runAtTick(20,()->{
             try { activateFrame(overworld,a); }
@@ -301,6 +311,14 @@ public final class AdvancedTeleportGameTests implements FabricGameTest {
 
     private static void clearFrame(ServerWorld world,BlockPos origin) {
         for(int x=0;x<=3;x++)for(int y=0;y<=4;y++)world.setBlockState(origin.add(x,y,0),Blocks.AIR.getDefaultState(),3);
+    }
+
+    private static void forceFrame(ServerWorld world,BlockPos origin,boolean forced) {
+        // Remote portal tests must keep their observed chunks loaded across scheduled assertions.
+        for(int x=origin.getX()>>4;x<=((origin.getX()+3)>>4);x++) {
+            world.setChunkForced(x,origin.getZ()>>4,forced);
+            if(forced)world.getChunk(x,origin.getZ()>>4);
+        }
     }
 
     private static boolean testPortalLink(PortalLink link,BlockPos source,BlockPos destination) {

@@ -30,6 +30,10 @@ public final class AtpConfig {
     public int maxPendingChangesPerTick = 4;
     public int clientResponseTimeoutTicks = 100;
     public int maxGraphEntries = 100_000;
+    /** Disabled by default: graph-selected coordinates must not silently move. */
+    public boolean safeLanding = false;
+    public int safeLandingVerticalRange = 16;
+    public int maxTeleportUpdates = 32;
 
     public void validate() {
         if (mode == null) throw new IllegalArgumentException("mode must be default, strict or off");
@@ -50,6 +54,8 @@ public final class AtpConfig {
         range("maxPendingChangesPerTick", maxPendingChangesPerTick, 1, 256);
         range("clientResponseTimeoutTicks", clientResponseTimeoutTicks, 20, 1200);
         range("maxGraphEntries", maxGraphEntries, 100, 1_000_000);
+        range("safeLandingVerticalRange", safeLandingVerticalRange, 0, 64);
+        range("maxTeleportUpdates", maxTeleportUpdates, 1, 256);
     }
 
     public GraphSettings graphSettings() {

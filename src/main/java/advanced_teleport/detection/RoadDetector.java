@@ -8,9 +8,11 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Supplier;
 
@@ -40,6 +42,79 @@ public final class RoadDetector {
         return new Scan(source, dimension, settings).around(changed);
     }
 
+    /** Validates uploaded automatic segments against authoritative blocks without an area scan. */
+    public static List<Road> validateCandidates(BlockSource source,String dimension,List<Road> candidates,DetectorSettings settings) {
+        Set<Road> submitted=Set.copyOf(candidates);
+        return validateExistingCandidates(source,dimension,candidates,settings).accepted().stream()
+                .filter(submitted::contains).toList();
+    }
+
+    public record CandidateValidation(List<Road> accepted,Set<String> rejectedIds,Set<String> unknownIds) {
+        public CandidateValidation {
+            accepted=List.copyOf(accepted);
+            rejectedIds=Set.copyOf(rejectedIds);
+            unknownIds=Set.copyOf(unknownIds);
+        }
+    }
+
+    /** For trusted existing entries, returns the current geometry even when road width has changed. */
+    public static CandidateValidation validateExistingCandidates(BlockSource source,String dimension,List<Road> candidates,DetectorSettings settings) {
+        Scan scan=new Scan(source,dimension,settings);
+        Map<String,Road> accepted=new LinkedHashMap<>();
+        Set<String> rejected=new LinkedHashSet<>(),unknown=new LinkedHashSet<>(),seen=new HashSet<>();
+        for(Road candidate:candidates) {
+            if(!seen.add(candidate.id()))continue;
+            ParsedId parsed=parseId(dimension,candidate.id());
+            if(candidate.protectedEntry() || !dimension.equals(candidate.dimension()) || parsed==null
+                    || candidate.kind()!=(parsed.kind().equals("rail")?RoadKind.RAIL:RoadKind.ICE)) {
+                rejected.add(candidate.id());continue;
+            }
+            try {
+                Road actual=scan.evaluate(candidate.id(),parsed);
+                if(actual==null)rejected.add(candidate.id());
+                else accepted.put(actual.id(),actual);
+            } catch(Unavailable unavailable) {unknown.add(candidate.id());}
+        }
+        return new CandidateValidation(new ArrayList<>(accepted.values()),rejected,unknown);
+    }
+
+    public static Optional<Cell> candidateAnchor(String dimension,String id) {
+        ParsedId parsed=parseId(dimension,id);
+        return parsed==null?Optional.empty():Optional.of(parsed.anchor());
+    }
+
+    private record ParsedId(String kind,Cell anchor,String suffix) {}
+
+    private static ParsedId parseId(String dimension,String id) {
+        if(dimension==null||id==null)return null;
+        for(String kind:List.of("rail","ice","ice_corner")) {
+            String prefix="auto:"+kind+":"+dimension+":";
+            if(!id.startsWith(prefix))continue;
+            String[] parts=id.substring(prefix.length()).split(":",-1);
+            if(parts.length!=(kind.equals("rail")?5:4))return null;
+            try {
+                int x=Integer.parseInt(parts[0]),y=Integer.parseInt(parts[1]),z=Integer.parseInt(parts[2]);
+                // Keep neighbor arithmetic inside integers and reject coordinates outside Minecraft's horizontal bounds.
+                if(Math.abs((long)x)>30_000_000||Math.abs((long)z)>30_000_000||Math.abs((long)y)>1_000_000)return null;
+                String suffix=parts[3];
+                if(kind.equals("rail")) {
+                    int direction=Integer.parseInt(parts[3]),rise=Integer.parseInt(parts[4]);
+                    if((direction!=Direction.EAST.ordinal()&&direction!=Direction.SOUTH.ordinal())||rise < -1||rise>1)return null;
+                    suffix=direction+":"+rise;
+                } else if(kind.equals("ice")) {
+                    if(!suffix.equals("x")&&!suffix.equals("z"))return null;
+                } else {
+                    int direction=Integer.parseInt(suffix);
+                    if(direction<0||direction>=Direction.values().length)return null;
+                    suffix=Integer.toString(direction);
+                }
+                if(!id.equals(prefix+x+":"+y+":"+z+":"+suffix))return null;
+                return new ParsedId(kind,new Cell(x,y,z),suffix);
+            } catch(NumberFormatException malformed) {return null;}
+        }
+        return null;
+    }
+
     private enum Direction {
         NORTH(0,-1), EAST(1,0), SOUTH(0,1), WEST(-1,0);
         final int x, z;
@@ -67,6 +142,7 @@ public final class RoadDetector {
         private final DetectorSettings settings;
         private final Map<Cell, BlockSample> samples = new HashMap<>();
         private final Map<Cell, Boolean> qualifiedRails = new HashMap<>();
+        private final Map<Cell, Boolean> qualifiedCorners = new HashMap<>();
         private final List<Road> roads = new ArrayList<>();
         private final Set<String> examinedIds = new LinkedHashSet<>();
         private boolean complete = true;
@@ -105,6 +181,24 @@ public final class RoadDetector {
 
         private String id(String kind, Cell cell, String suffix) {
             return "auto:"+kind+":"+dimension+":"+cell.x()+":"+cell.y()+":"+cell.z()+":"+suffix;
+        }
+
+        private Road evaluate(String id,ParsedId parsed) {
+            Cell anchor=parsed.anchor();
+            return switch(parsed.kind()) {
+                case "rail" -> {
+                    String[] suffix=parsed.suffix().split(":");
+                    Direction direction=Direction.values()[Integer.parseInt(suffix[0])];
+                    Cell other=direction.offset(anchor,1).add(0,Integer.parseInt(suffix[1]),0);
+                    yield railEdge(id,anchor,other,direction);
+                }
+                case "ice" -> iceEdge(id,anchor,parsed.suffix().equals("x"));
+                case "ice_corner" -> {
+                    Direction direction=Direction.values()[Integer.parseInt(parsed.suffix())];
+                    yield iceCorner(id,anchor,direction,Direction.values()[(direction.ordinal()+1)%4]);
+                }
+                default -> null;
+            };
         }
 
         private void candidate(String id, Supplier<Road> operation) {
@@ -163,9 +257,14 @@ public final class RoadDetector {
         private boolean qualifiedRail(Cell cell) {
             Boolean existing=qualifiedRails.get(cell);
             if(existing!=null) return existing;
-            boolean value=straightPair(cell) || nearPairedCorner(cell);
-            qualifiedRails.put(cell,value);
-            return value;
+            boolean unknown=false;
+            try {if(straightPair(cell)){qualifiedRails.put(cell,true);return true;}}
+            catch(Unavailable ignored){unknown=true;}
+            try {if(nearPairedCorner(cell)){qualifiedRails.put(cell,true);return true;}}
+            catch(Unavailable ignored){unknown=true;}
+            if(unknown)throw new Unavailable();
+            qualifiedRails.put(cell,false);
+            return false;
         }
 
         private boolean straightPair(Cell cell) {
@@ -187,18 +286,89 @@ public final class RoadDetector {
         }
 
         private boolean pairedCorner(Cell cell) {
+            Boolean known=qualifiedCorners.get(cell);
+            if(known!=null)return known;
             BlockSample state=block(cell);
             if(state.kind()!=Kind.RAIL || !isCorner(state.shape())) return false;
             int diagonalSign=(state.shape()==Shape.NORTH_EAST || state.shape()==Shape.SOUTH_WEST)?-1:1;
             int maximum=settings.railCornerMaxGap()+1;
+            boolean unknown=false;
             for(int dx=-maximum;dx<=maximum;dx++) for(int dz=-maximum;dz<=maximum;dz++) {
                 if(dx==0 || dz==0 || Integer.signum(dx*dz)!=diagonalSign) continue;
                 int gap=Math.abs(dx)+Math.abs(dz)-1;
                 if(gap<settings.railCornerMinGap() || gap>settings.railCornerMaxGap()) continue;
-                BlockSample other=block(cell.add(dx,0,dz));
-                if(other.kind()==Kind.RAIL && other.shape()==state.shape()) return true;
+                Cell partner=cell.add(dx,0,dz);
+                try {
+                    BlockSample other=block(partner);
+                    if(other.kind()==Kind.RAIL && other.shape()==state.shape() && validCornerApproaches(cell,partner,state.shape())) {
+                        qualifiedCorners.put(cell,true);qualifiedCorners.put(partner,true);return true;
+                    }
+                } catch(Unavailable ignored){unknown=true;}
             }
+            if(unknown)throw new Unavailable();
+            qualifiedCorners.put(cell,false);
             return false;
+        }
+
+        private boolean validCornerApproaches(Cell first,Cell second,Shape shape) {
+            boolean unknown=false;
+            Set<Cell> proof=new HashSet<>();
+            for(Step arm:steps(shape)) {
+                try {if(!pairedApproach(first,second,arm.direction(),proof))return false;}
+                catch(Unavailable ignored){unknown=true;}
+            }
+            if(unknown)throw new Unavailable();
+            // Only the proven continuous bend/transition is exceptional; nearby lone rails are not.
+            for(Cell cell:proof)qualifiedRails.put(cell,true);
+            return true;
+        }
+
+        private record Approach(Map<Cell,List<Cell>> paths,boolean unknown) {}
+
+        private boolean pairedApproach(Cell first,Cell second,Direction direction,Set<Cell> proof) {
+            boolean alongX=direction.x!=0;
+            int separation=alongX?Math.abs(first.z()-second.z()):Math.abs(first.x()-second.x());
+            if(separation!=settings.railStraightGap()+1)return false;
+            int firstCoordinate=alongX?first.x():first.z(),secondCoordinate=alongX?second.x():second.z();
+            int sign=alongX?direction.x:direction.z;
+            int target=(sign>0?Math.max(firstCoordinate,secondCoordinate):Math.min(firstCoordinate,secondCoordinate))+sign;
+            Approach a=approach(first,direction,Math.abs(target-firstCoordinate));
+            Approach b=approach(second,direction,Math.abs(target-secondCoordinate));
+            for(Cell left:a.paths().keySet())for(Cell right:b.paths().keySet()) {
+                BlockSample l=block(left),r=block(right);
+                if(left.y()==right.y()&&l.kind()==Kind.POWERED_RAIL&&l.powered()
+                        &&r.kind()==Kind.POWERED_RAIL&&r.powered()&&l.shape()==r.shape()) {
+                    proof.addAll(a.paths().get(left));proof.addAll(b.paths().get(right));return true;
+                }
+            }
+            if(a.unknown()||b.unknown())throw new Unavailable();
+            return false;
+        }
+
+        /** Follow a specific straight/sloping arm; no disconnected or alternate bend can prove a second lane. */
+        private Approach approach(Cell start,Direction direction,int length) {
+            Map<Cell,List<Cell>> frontier=Map.of(start,List.of(start));
+            boolean unknown=false;
+            for(int distance=0;distance<length;distance++) {
+                Map<Cell,List<Cell>> next=new LinkedHashMap<>();
+                for(var entry:frontier.entrySet()) {
+                    Cell current=entry.getKey();
+                    BlockSample state=block(current);
+                    for(int dy:new int[]{0,-1,1}) {
+                        Cell neighbor=direction.offset(current,1).add(0,dy,0);
+                        try {
+                            BlockSample other=block(neighbor);
+                            if(usableRail(other)&&!isCorner(other.shape())&&connected(current,state,neighbor,other,direction)) {
+                                List<Cell> route=new ArrayList<>(entry.getValue());route.add(neighbor);
+                                next.putIfAbsent(neighbor,List.copyOf(route));
+                            }
+                        } catch(Unavailable ignored){unknown=true;}
+                    }
+                }
+                frontier=next;
+                if(frontier.isEmpty())break;
+            }
+            return new Approach(frontier,unknown);
         }
 
         private boolean nearPairedCorner(Cell start) {
@@ -206,20 +376,27 @@ public final class RoadDetector {
             var visited=new HashSet<Cell>();
             queue.add(new Visit(start,0));
             int maximum=settings.railCornerMaxGap()+1;
+            boolean unknown=false;
             while(!queue.isEmpty()) {
                 Visit visit=queue.removeFirst();
                 if(!visited.add(visit.cell())) continue;
-                BlockSample state=block(visit.cell());
+                BlockSample state;
+                try {state=block(visit.cell());}
+                catch(Unavailable ignored){unknown=true;continue;}
                 if(!usableRail(state)) continue;
-                if(pairedCorner(visit.cell())) return true;
+                try {if(pairedCorner(visit.cell())&&Boolean.TRUE.equals(qualifiedRails.get(start))) return true;}
+                catch(Unavailable ignored){unknown=true;}
                 if(visit.distance()>=maximum) continue;
                 for(Step step:steps(state.shape())) for(int dy=-1;dy<=1;dy++) {
                     Cell next=step.direction().offset(visit.cell(),1).add(0,dy,0);
-                    BlockSample other=block(next);
-                    if(usableRail(other) && connected(visit.cell(),state,next,other,step.direction()))
-                        queue.addLast(new Visit(next,visit.distance()+1));
+                    try {
+                        BlockSample other=block(next);
+                        if(usableRail(other) && connected(visit.cell(),state,next,other,step.direction()))
+                            queue.addLast(new Visit(next,visit.distance()+1));
+                    } catch(Unavailable ignored){unknown=true;}
                 }
             }
+            if(unknown)throw new Unavailable();
             return false;
         }
 

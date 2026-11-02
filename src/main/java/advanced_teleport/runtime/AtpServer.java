@@ -28,6 +28,8 @@ import net.minecraft.util.math.Box;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.Consumer;
 
 /** All authoritative state and mutations live on the server thread. */
 public final class AtpServer implements AutoCloseable {
@@ -35,32 +37,47 @@ public final class AtpServer implements AutoCloseable {
     private final MinecraftServer server;
     private final String worldName;
     private final Path configFile;
-    private final GraphStore store;
+    private final AsyncGraphStore store;
     private final GraphEditor editor;
+    private final PortalTracker portals;
     private AtpConfig config;
     private GraphEngine engine;
-    private long engineRevision = -1, persistedRevision, configEpoch, clock, nextRequest, nextTransfer;
-    private boolean storageHealthy = true;
-    private final Set<Change> changes = new LinkedHashSet<>();
+    private long engineRevision = -1, configEpoch, clock, nextRequest, nextTransfer, acceptedRoadProposals;
+    private final Map<Change,DirtyChange> changes = new LinkedHashMap<>();
     private final Map<String, ChunkJob> chunkJobs = new LinkedHashMap<>();
+    private final Map<String,net.minecraft.world.chunk.WorldChunk> loadedChunks=new HashMap<>();
+    private final Map<String,Long> completenessAudits=new HashMap<>();
     private final Map<UUID, Pending> pending = new HashMap<>();
     private final Map<UUID, Transfer> outgoing = new HashMap<>();
-    private final Map<UUID, Stamp> delivered = new HashMap<>();
-    private final Map<UUID, Long> lastClientChange = new HashMap<>();
+    private final Map<UUID, Delivered> delivered = new HashMap<>();
+    private final Map<UUID, PendingEncoding> encoding=new HashMap<>();
+    private final Map<UUID, Stamp> failedSync=new HashMap<>();
+    private final Map<UUID, long[]> proposalBudgets = new HashMap<>();
     private final Map<UUID, Long> lastRequest = new HashMap<>();
-    private final Map<String,Long> portalLookups = new HashMap<>();
-    private final Set<String> portalChecks = new LinkedHashSet<>();
+    private final ExecutorService syncWorker=Executors.newSingleThreadExecutor(r->{Thread t=new Thread(r,"ATP sync encoder");t.setDaemon(true);return t;});
+    private final Map<EncodingKey,CompletableFuture<byte[]>> encoded=new LinkedHashMap<>();
     private record Change(String dimension, BlockPos pos) {}
-    private record Pending(long id, long revision, long deadline, Point source, Point target, Point expected) {}
+    private static final class DirtyChange {
+        final long queuedAt;
+        final Map<String,Road> proposals=new LinkedHashMap<>();
+        boolean hasProposal, authoritativeEdit;
+        DirtyChange(long tick){queuedAt=tick;}
+    }
+    private record Pending(long id,long revision,long configEpoch,long deadline,Point target,Point expected,
+                           float yaw,float pitch,Consumer<ServerPlayerEntity> afterTeleport) {}
     private record Stamp(long revision, long configEpoch) {}
+    private record Delivered(Snapshot graph,long epoch) {}
+    private record EncodingKey(long baseRevision,long targetRevision,long epoch) {}
+    private record PendingEncoding(Stamp stamp,Snapshot graph,CompletableFuture<byte[]> bytes) {}
     private static final class ChunkJob {
         final ServerWorld world; final net.minecraft.world.chunk.WorldChunk chunk;
         final Set<BlockPos> seeds = new LinkedHashSet<>(); int cursor;
+        boolean priority;
         ChunkJob(ServerWorld world,net.minecraft.world.chunk.WorldChunk chunk){this.world=world;this.chunk=chunk;}
     }
     private static final class Transfer {
-        final long id; final byte[] data; final Stamp stamp; int offset;
-        Transfer(long id, byte[] data, Stamp stamp) { this.id = id; this.data = data; this.stamp=stamp; }
+        final long id; final byte[] data; final Stamp stamp; final Snapshot graph; int offset;
+        Transfer(long id,byte[] data,Stamp stamp,Snapshot graph){this.id=id;this.data=data;this.stamp=stamp;this.graph=graph;}
     }
 
     public AtpServer(MinecraftServer server, Path root) throws Exception {
@@ -73,12 +90,11 @@ public final class AtpServer implements AutoCloseable {
         String endpoint = server.isDedicated() ? (bindAddress.isBlank() ? "0.0.0.0" : bindAddress)
                 + ":" + server.getServerPort() : "singleplayer";
         Path directory = DataPaths.worldDirectory(root, endpoint, worldName);
-        store = new GraphStore(directory.resolve("graph.sqlite"));
-        Snapshot loaded = store.load();
+        store = new AsyncGraphStore(directory.resolve("graph.sqlite"));
+        Snapshot loaded = store.initial();
         if(entryCount(loaded)>config.maxGraphEntries)throw new IllegalStateException("Saved graph exceeds maxGraphEntries; increase it in "+configFile);
         editor = new GraphEditor(loaded, config.graphSettings());
-        schedulePortalChecks();
-        persistedRevision = loaded.revision();
+        portals=new PortalTracker(server,editor,()->config);
         SERVERS.put(server, this);
         Advanced_teleport.LOGGER.info("ATP world data: {} (revision {})", directory, loaded.revision());
     }
@@ -114,8 +130,17 @@ public final class AtpServer implements AutoCloseable {
     public void reload() throws Exception {
         requireThread();var replacement=AtpConfig.load(configFile);
         if(entryCount(snapshot())>replacement.maxGraphEntries)throw new IllegalArgumentException("maxGraphEntries is smaller than the current graph");
+        boolean detectionChanged=!detectorSettings(config).equals(detectorSettings(replacement));
         config = replacement; engine = null;
         pending.clear(); configEpoch++;
+        if(detectionChanged){
+            Set<String> automatic=new HashSet<>();
+            for(Road road:snapshot().roads())if(!road.protectedEntry())automatic.add(road.id());
+            editor.applyAutomatic(List.of(),automatic);
+            changes.clear();chunkJobs.clear();
+            for(var chunk:List.copyOf(loadedChunks.values()))
+                if(chunk.getWorld() instanceof ServerWorld world)chunkLoaded(world,chunk);
+        }
         for (var player : server.getPlayerManager().getPlayerList()) server.getCommandManager().sendCommandTree(player);
     }
     public void setMode(String mode) throws Exception {
@@ -128,15 +153,35 @@ public final class AtpServer implements AutoCloseable {
         return server.getWorld(RegistryKey.of(RegistryKeys.WORLD, new Identifier(dimension)));
     }
     public void enqueue(String dimension, BlockPos pos) {
-        if(changes.size()<8192)changes.add(new Change(dimension, pos.toImmutable()));
+        if(changes.size()<8192)changes.computeIfAbsent(new Change(dimension,pos.toImmutable()),k->new DirtyChange(clock));
         else {
             ServerWorld world=world(dimension);
             if(world!=null&&world.isChunkLoaded(pos))chunkLoaded(world,world.getChunk(pos.getX()>>4,pos.getZ()>>4));
         }
     }
+    public void blockChanged(String dimension,BlockPos pos){
+        enqueue(dimension,pos);
+        var change=new Change(dimension,pos.toImmutable());var dirty=changes.get(change);
+        if(dirty!=null)dirty.authoritativeEdit=true;
+        else {
+            invalidateUnverifiedRoads(change);
+            ServerWorld world=world(dimension);if(world!=null)portals.changed(world,pos);
+        }
+    }
+    private void invalidateUnverifiedRoads(Change change){
+        Set<String> ids=affectedAutomaticIds(change,detectorSettings(config));
+        if(!ids.isEmpty())editor.applyAutomatic(List.of(),ids);
+    }
+    private Set<String> affectedAutomaticIds(Change change,DetectorSettings settings){
+        Set<String> ids=new HashSet<>();
+        for(Road road:snapshot().roads())if(!road.protectedEntry()&&road.dimension().equals(change.dimension())
+                &&RoadDetector.candidateAnchor(change.dimension(),road.id()).map(c->withinScan(c,change.pos(),settings)).orElse(false))ids.add(road.id());
+        return ids;
+    }
     public void chunkLoaded(ServerWorld world,net.minecraft.world.chunk.WorldChunk chunk) {
         String dimension=world.getRegistryKey().getValue().toString();
         String key=dimension+":"+chunk.getPos().toLong();
+        loadedChunks.put(key,chunk);
         if(chunkJobs.containsKey(key))return;
         ChunkJob job=new ChunkJob(world,chunk);
         // Old segments also seed a scan: a road removed while this chunk was unloaded must disappear.
@@ -150,10 +195,18 @@ public final class AtpServer implements AutoCloseable {
         }
         chunkJobs.put(key,job);
     }
+    public void chunkUnloaded(ServerWorld world,net.minecraft.world.chunk.WorldChunk chunk){
+        String key=world.getRegistryKey().getValue()+":"+chunk.getPos().toLong();
+        loadedChunks.remove(key);chunkJobs.remove(key);completenessAudits.remove(key);
+    }
+    private static DetectorSettings detectorSettings(AtpConfig config){
+        return new DetectorSettings(config.railStraightGap,config.railCornerMinGap,config.railCornerMaxGap,config.iceMinWidth,config.iceMaxWidth);
+    }
     private static BlockPos seed(BlockPos p){return new BlockPos(Math.floorDiv(p.getX(),8)*8+4,Math.floorDiv(p.getY(),4)*4+2,Math.floorDiv(p.getZ(),8)*8+4);}
     private void discoverLoadedRoads() {
         if(chunkJobs.isEmpty()||changes.size()>4096)return;
-        var entry=chunkJobs.entrySet().iterator().next();var job=entry.getValue();
+        var entry=chunkJobs.entrySet().stream().filter(e->e.getValue().priority).findFirst().orElseGet(()->chunkJobs.entrySet().iterator().next());
+        var job=entry.getValue();
         if(!job.world.isChunkLoaded(job.chunk.getPos().x,job.chunk.getPos().z)){chunkJobs.remove(entry.getKey());return;}
         var sections=job.chunk.getSectionArray();int budget=4096;
         while(budget-->0 && job.cursor<sections.length*4096) {
@@ -161,6 +214,8 @@ public final class AtpServer implements AutoCloseable {
             if(section.isEmpty()){job.cursor=((cursor>>12)+1)*4096;continue;}
             int x=cursor&15,z=(cursor>>4)&15,y=(cursor>>8)&15;
             var state=section.getBlockState(x,y,z);
+            if(state.isOf(Blocks.NETHER_PORTAL)||state.isOf(Blocks.END_PORTAL))
+                portals.loadedPortal(job.world,new BlockPos(job.chunk.getPos().getStartX()+x,job.world.getBottomY()+(cursor>>12)*16+y,job.chunk.getPos().getStartZ()+z));
             if(state.getBlock() instanceof net.minecraft.block.AbstractRailBlock||state.isOf(Blocks.BLUE_ICE)||state.isOf(Blocks.NETHER_PORTAL)) {
                 job.seeds.add(seed(new BlockPos(job.chunk.getPos().getStartX()+x,job.world.getBottomY()+(cursor>>12)*16+y,job.chunk.getPos().getStartZ()+z)));
             }
@@ -172,13 +227,82 @@ public final class AtpServer implements AutoCloseable {
         }
     }
 
-    public void clientChange(ServerPlayerEntity player, String dimension, BlockPos pos) {
-        // Updates are hints; the submitted geometry never becomes authoritative.
-        if (!point(player).dimension().equals(dimension) || player.squaredDistanceTo(pos.getX(),pos.getY(),pos.getZ()) > 128 * 128) return;
-        long last = lastClientChange.getOrDefault(player.getUuid(), -1L);
-        if (last == clock) return;
-        lastClientChange.put(player.getUuid(), clock);
-        if (player.getServerWorld().isChunkLoaded(pos)) enqueue(dimension,pos);
+    public void clientProposal(ServerPlayerEntity player,Protocol.RoadProposal proposal) {
+        requireThread();
+        BlockPos pos=proposal.anchor();
+        if(!point(player).dimension().equals(proposal.dimension())||player.squaredDistanceTo(pos.getX(),pos.getY(),pos.getZ())>128*128
+                ||!player.getServerWorld().isChunkLoaded(pos)||proposal.revision()>snapshot().revision())return;
+        long[] rate=proposalBudgets.computeIfAbsent(player.getUuid(),k->new long[]{clock,0});
+        if(rate[0]!=clock){rate[0]=clock;rate[1]=0;}
+        if(++rate[1]>4)return;
+        var settings=detectorSettings(config);
+        for(Road road:proposal.roads()){
+            var anchor=RoadDetector.candidateAnchor(proposal.dimension(),road.id());
+            if(anchor.isEmpty()||!withinScan(anchor.get(),pos,settings))return;
+        }
+        enqueue(proposal.dimension(),pos);
+        var dirty=changes.get(new Change(proposal.dimension(),pos));
+        if(dirty==null)return;
+        dirty.hasProposal=true;
+        for(Road road:proposal.roads())if(dirty.proposals.size()<4096)dirty.proposals.put(road.id(),road);
+    }
+
+    private static boolean withinScan(RoadDetector.Cell cell,BlockPos pos,DetectorSettings settings){
+        return Math.abs((long)cell.x()-pos.getX())<=settings.scanRadius()
+                &&Math.abs((long)cell.z()-pos.getZ())<=settings.scanRadius()
+                &&Math.abs((long)cell.y()-pos.getY())<=settings.verticalScanRadius();
+    }
+    private void processChange(Change change,DirtyChange dirty){
+        ServerWorld world=world(change.dimension());
+        if(world==null)return;
+        if(!world.isChunkLoaded(change.pos())){
+            // A witnessed server edit cannot leave old, unverified connections usable after unload.
+            // Mere client observations/chunk-load hints never authorize this invalidation.
+            if(dirty.authoritativeEdit)invalidateUnverifiedRoads(change);
+            portals.changed(world,change.pos());return;
+        }
+        var settings=detectorSettings(config);var source=new MinecraftBlockSource(world);
+        if(dirty.hasProposal){
+            List<Road> existing=snapshot().roads().stream().filter(r->!r.protectedEntry()&&r.dimension().equals(change.dimension()))
+                    .filter(r->RoadDetector.candidateAnchor(change.dimension(),r.id()).map(c->withinScan(c,change.pos(),settings)).orElse(false)).toList();
+            var checked=RoadDetector.validateExistingCandidates(source,change.dimension(),existing,settings);
+            Map<String,Road> accepted=new LinkedHashMap<>();checked.accepted().forEach(r->accepted.put(r.id(),r));
+            var uploaded=RoadDetector.validateCandidates(source,change.dimension(),List.copyOf(dirty.proposals.values()),settings);
+            acceptedRoadProposals+=uploaded.size();
+            for(Road road:uploaded)accepted.put(road.id(),road);
+            Set<String> examined=new HashSet<>(checked.rejectedIds());examined.addAll(accepted.keySet());
+            if(dirty.authoritativeEdit)examined.addAll(checked.unknownIds());
+            applyObservations(List.copyOf(accepted.values()),examined);
+            scheduleCompletenessScan(world,change.pos());
+        }else{
+            var p=change.pos();var scan=RoadDetector.scan(source,change.dimension(),new RoadDetector.Cell(p.getX(),p.getY(),p.getZ()),settings);
+            Set<String> examined=new HashSet<>(scan.examinedIds());
+            if(dirty.authoritativeEdit)examined.addAll(affectedAutomaticIds(change,settings));
+            applyObservations(scan.roads(),examined);
+        }
+        portals.changed(world,change.pos());
+    }
+    private void scheduleCompletenessScan(ServerWorld world,BlockPos changed){
+        // Uploaded lists are candidates, not proof that no other road exists. Coalesce background
+        // discovery by loaded chunk so omitted/partial batches cannot permanently hide new roads.
+        String dimension=world.getRegistryKey().getValue().toString();
+        for(int x=(changed.getX()>>4)-1;x<=(changed.getX()>>4)+1;x++)for(int z=(changed.getZ()>>4)-1;z<=(changed.getZ()>>4)+1;z++){
+            if(!world.isChunkLoaded(x,z))continue;
+            var chunk=world.getChunk(x,z);String key=dimension+":"+chunk.getPos().toLong();
+            if(clock-completenessAudits.getOrDefault(key,-200L)<200)continue;
+            completenessAudits.put(key,clock);chunkLoaded(world,chunk);
+            var job=chunkJobs.get(key);if(job!=null)job.priority=true;
+        }
+    }
+    private void applyObservations(List<Road> observed,Set<String> examined){
+        Snapshot current=snapshot();
+        long retained=current.roads().stream().filter(r->r.protectedEntry()||!examined.contains(r.id())).count();
+        int room=(int)Math.max(0,config.maxGraphEntries-retained-current.cities().size()-current.stations().size()-current.portals().size());
+        Set<String> known=new HashSet<>();current.roads().forEach(r->known.add(r.id()));
+        List<Road> accepted=new ArrayList<>();
+        for(Road road:observed)if(known.contains(road.id())&&accepted.size()<room)accepted.add(road);
+        for(Road road:observed)if(!known.contains(road.id())&&accepted.size()<room)accepted.add(road);
+        editor.applyAutomatic(accepted,examined);
     }
 
     public void tick() {
@@ -186,57 +310,61 @@ public final class AtpServer implements AutoCloseable {
         discoverLoadedRoads();
         int work = config.maxPendingChangesPerTick;
         while (work-- > 0 && !changes.isEmpty()) {
-            Change change = changes.iterator().next(); changes.remove(change);
-            ServerWorld world = world(change.dimension());
-            if (world == null || !world.isChunkLoaded(change.pos())) continue;
-            var settings = new DetectorSettings(config.railStraightGap,config.railCornerMinGap,config.railCornerMaxGap,config.iceMinWidth,config.iceMaxWidth);
-            var p = change.pos();
-            var scan = RoadDetector.scan(new MinecraftBlockSource(world), change.dimension(), new RoadDetector.Cell(p.getX(),p.getY(),p.getZ()),settings);
-            long retained=snapshot().roads().stream().filter(r->r.protectedEntry()||!scan.examinedIds().contains(r.id())).count();
-            int room=(int)Math.max(0,config.maxGraphEntries-retained-snapshot().cities().size()-snapshot().stations().size()-snapshot().portals().size());
-            editor.applyAutomatic(scan.roads().stream().limit(room).toList(),scan.examinedIds());
-            invalidatePortals(change);
-            Point nearbyPortal=findPortal(world,p);
-            if(nearbyPortal!=null)linkExistingPortal(nearbyPortal);
+            var ready=changes.entrySet().stream().filter(e->e.getValue().hasProposal||clock-e.getValue().queuedAt>=3).findFirst().orElse(null);
+            if(ready==null)break;
+            changes.remove(ready.getKey());processChange(ready.getKey(),ready.getValue());
         }
-        recheckOnePortal();
+        portals.tick();
         pending.entrySet().removeIf(entry -> {
             if (entry.getValue().deadline() >= clock) return false;
             var player = server.getPlayerManager().getPlayer(entry.getKey());
             if (player != null) message(player,"传送计算已超时，请等待数据同步后重试。");
             return true;
         });
-        if (clock % 20 == 0 && persistedRevision != snapshot().revision()) persist();
+        if(clock%20==0&&store.persistedRevision()!=snapshot().revision())store.submit(snapshot());
         if (clock % 10 == 0) {
-            byte[] data = null;
             Stamp current=new Stamp(snapshot().revision(),configEpoch);
             for (var player : server.getPlayerManager().getPlayerList()) {
-                // Finish an older transfer before beginning a newer snapshot.
-                if (!outgoing.containsKey(player.getUuid()) && !current.equals(delivered.get(player.getUuid()))
+                Delivered previous=delivered.get(player.getUuid());
+                boolean currentAtClient=previous!=null&&previous.graph().revision()==current.revision()&&previous.epoch()==current.configEpoch();
+                if (!outgoing.containsKey(player.getUuid())&&!encoding.containsKey(player.getUuid())&&!currentAtClient
+                        &&!current.equals(failedSync.get(player.getUuid()))
                         && ServerPlayNetworking.canSend(player,Protocol.SNAPSHOT)) {
-                    if(data==null)data=syncBytes();
-                    queueSync(player,data);
+                    queueSync(player,previous==null?null:previous.graph());
                 }
             }
         }
+        finishEncodings();
         pumpTransfers();
     }
-    private void persist() {
-        try { store.save(snapshot()); persistedRevision = snapshot().revision(); storageHealthy = true; }
-        catch (Exception failure) { storageHealthy = false; Advanced_teleport.LOGGER.error("ATP could not persist graph; restricted TP disabled until storage recovers",failure); }
+    public void sync(ServerPlayerEntity player) {
+        delivered.remove(player.getUuid());outgoing.remove(player.getUuid());encoding.remove(player.getUuid());failedSync.remove(player.getUuid());
+        queueSync(player,null);
     }
-    private byte[] syncBytes() {
-        byte[] data = Protocol.JSON.toJson(new Protocol.Sync(worldName,config,snapshot())).getBytes(StandardCharsets.UTF_8);
-        if (data.length > SnapshotAssembly.MAX_BYTES) {
-            Advanced_teleport.LOGGER.error("ATP graph exceeds 32 MiB snapshot limit; graph synchronization suspended");
-            return null;
+    private void queueSync(ServerPlayerEntity player,Snapshot base) {
+        if(!ServerPlayNetworking.canSend(player,Protocol.SNAPSHOT))return;
+        Snapshot target=snapshot();AtpConfig settings=config();
+        var key=new EncodingKey(base==null?-1:base.revision(),target.revision(),configEpoch);
+        var bytes=encoded.computeIfAbsent(key,k->CompletableFuture.supplyAsync(()->Protocol.encodeSync(worldName,settings,base,target),syncWorker));
+        while(encoded.size()>8)encoded.remove(encoded.keySet().iterator().next());
+        encoding.put(player.getUuid(),new PendingEncoding(new Stamp(target.revision(),configEpoch),target,bytes));
+    }
+    private void finishEncodings(){
+        var iterator=encoding.entrySet().iterator();
+        while(iterator.hasNext()){
+            var entry=iterator.next();var result=entry.getValue();
+            if(!result.bytes().isDone())continue;
+            iterator.remove();
+            var player=server.getPlayerManager().getPlayer(entry.getKey());if(player==null)continue;
+            try{
+                byte[] bytes=result.bytes().join();
+                outgoing.put(entry.getKey(),new Transfer(++nextTransfer,bytes,result.stamp(),result.graph()));
+            }catch(CompletionException failure){
+                failedSync.put(entry.getKey(),result.stamp());
+                Advanced_teleport.LOGGER.error("Cannot encode ATP graph update",failure.getCause());
+                message(player,"路网同步失败，请联系管理员检查日志。");
+            }
         }
-        return data;
-    }
-    public void sync(ServerPlayerEntity player) { queueSync(player,syncBytes()); }
-    private void queueSync(ServerPlayerEntity player, byte[] data) {
-        if(data==null){message(player,"路网超过同步大小上限，请联系管理员。");return;}
-        if (ServerPlayNetworking.canSend(player,Protocol.SNAPSHOT)) outgoing.put(player.getUuid(),new Transfer(++nextTransfer,data,new Stamp(snapshot().revision(),configEpoch)));
     }
     private void pumpTransfers() {
         var iterator = outgoing.entrySet().iterator();
@@ -252,23 +380,54 @@ public final class AtpServer implements AutoCloseable {
                 buf.writeByteArray(Arrays.copyOfRange(transfer.data,transfer.offset,end));
                 ServerPlayNetworking.send(player,Protocol.SNAPSHOT,buf); transfer.offset=end;
             }
-            if (transfer.offset == transfer.data.length) { iterator.remove(); delivered.put(player.getUuid(),transfer.stamp); }
+            if (transfer.offset == transfer.data.length) { iterator.remove(); delivered.put(player.getUuid(),new Delivered(transfer.graph,transfer.stamp.configEpoch())); }
         }
     }
 
+    /** Refresh only geometry relevant to this request; unrelated work keeps its normal tick budget. */
+    public boolean flushRelevantChanges(Point source,Point target,boolean strict){
+        requireThread();
+        int remaining=config.maxTeleportUpdates;
+        while(true){
+            double radius=Math.max(detectorSettings(config).scanRadius()+config.roadConnectionDistance,
+                    Math.max(config.portalConnectionDistance,config.roadAccessDistance))+2;
+            var influence=new GraphInfluence(engine(),source,target,strict,radius);
+            var relevant=changes.entrySet().stream().filter(e->influence.contains(blockPoint(e.getKey()))).toList();
+            var entrances=portals.pendingEntrances().stream().filter(influence::contains).toList();
+            var links=portals.pendingLinkIds().stream().filter(influence::containsPortal).toList();
+            if(relevant.isEmpty()&&entrances.isEmpty()&&links.isEmpty())return true;
+            if(remaining<=0)return false;
+            for(var entry:relevant){
+                if(remaining--<=0)return false;
+                changes.remove(entry.getKey());processChange(entry.getKey(),entry.getValue());
+            }
+            for(Point entrance:entrances){if(remaining--<=0)return false;if(!portals.checkEntrance(entrance))return false;}
+            for(String link:links){if(remaining--<=0)return false;portals.checkLink(link);}
+        }
+    }
+    private static Point blockPoint(Change change){return new Point(change.dimension(),change.pos().getX()+.5,change.pos().getY(),change.pos().getZ()+.5);}
+
     public void request(ServerCommandSource source, Collection<? extends Entity> targets, Point target) throws CommandSyntaxException {
+        ServerPlayerEntity player=source.getPlayerOrThrow();
+        request(source,targets,target,player.getYaw(),player.getPitch(),null);
+    }
+    public void request(ServerCommandSource source,Collection<? extends Entity> targets,Point target,float yaw,float pitch,
+                        Consumer<ServerPlayerEntity> afterTeleport)throws CommandSyntaxException {
         ServerPlayerEntity player = source.getPlayerOrThrow();
         if (targets.size()!=1 || targets.iterator().next()!=player) throw error("普通玩家只能传送自己。");
-        if (!storageHealthy) throw error("ATP 数据保存失败，暂时无法传送，请联系管理员。");
-        if(!changes.isEmpty()||!portalChecks.isEmpty())throw error("路网变化正在处理，请稍后重试。");
-        if (!ServerPlayNetworking.canSend(player,Protocol.TP_QUERY)) throw error("需要安装客户端 Advanced Teleport 才能使用受限传送。");
+        if (!store.healthy()) throw error("ATP 数据保存失败，暂时无法传送，请联系管理员。");
+        if (!ServerPlayNetworking.canSend(player,Protocol.TP_QUERY)||!ServerPlayNetworking.canSend(player,Protocol.SNAPSHOT))
+            throw error("需要安装相同版本的客户端 Advanced Teleport 才能使用受限传送。");
         if (world(target.dimension()) == null || Math.abs(target.x())>29_999_984 || Math.abs(target.z())>29_999_984) throw error("目标坐标无效。");
         if (clock-lastRequest.getOrDefault(player.getUuid(),-100L)<10) throw error("请稍候再发送传送请求。");
         lastRequest.put(player.getUuid(),clock);
         Point start = point(player);
-        Point expected = engine().resolve(start,target,config.mode.equals("strict")).orElseThrow(() -> error(
+        boolean strict=config.mode.equals("strict");
+        if(!flushRelevantChanges(start,target,strict))throw error("当前路线的修改正在处理，请稍后重试。");
+        Point expected = engine().resolve(start,target,strict).orElseThrow(() -> error(
                 config.mode.equals("strict") ? "严格模式需要靠近已注册站点，且目标必须位于已知路网或城市中。" : "你不在联结区域内，或路网未连接到目标维度。"));
-        Pending request = new Pending(++nextRequest,snapshot().revision(),clock+config.clientResponseTimeoutTicks,start,target,expected);
+        Pending request = new Pending(++nextRequest,snapshot().revision(),configEpoch,clock+config.clientResponseTimeoutTicks,target,expected,
+                net.minecraft.util.math.MathHelper.wrapDegrees(yaw),net.minecraft.util.math.MathHelper.wrapDegrees(pitch),afterTeleport);
         pending.put(player.getUuid(),request);
         var buf = PacketByteBufs.create(); buf.writeLong(request.id());buf.writeLong(request.revision());
         Protocol.writePoint(buf,start); Protocol.writePoint(buf,target);
@@ -280,20 +439,23 @@ public final class AtpServer implements AutoCloseable {
         Pending request = pending.get(player.getUuid());
         if (request==null || request.id()!=id) return;
         pending.remove(player.getUuid());
-        if (!enabled() || !storageHealthy || !changes.isEmpty() || !portalChecks.isEmpty() || request.deadline()<clock || revision!=request.revision() || revision!=snapshot().revision()) {
+        if (!enabled() || !store.healthy() || request.configEpoch()!=configEpoch || request.deadline()<clock || revision!=request.revision()) {
             sync(player);message(player,"路网数据已更新，请同步完成后重试。");return;
         }
-        if (distanceSquared(request.source(),point(player))>1) { message(player,"计算期间位置发生变化，请重新传送。");return; }
+        Point source=point(player);
+        if(!flushRelevantChanges(source,request.target(),config.mode.equals("strict"))){message(player,"当前路线的修改尚未处理完成，请重试。");return;}
         Point proposal = config.mode.equals("strict") ? strict : normal;
-        Point verified = engine().resolve(point(player),request.target(),config.mode.equals("strict")).orElse(null);
+        Point verified = engine().resolve(source,request.target(),config.mode.equals("strict")).orElse(null);
         if (proposal==null || verified==null || distanceSquared(proposal,verified)>1e-6
                 || distanceSquared(request.expected(),verified)>1e-6) {
             message(player,"客户端计算与服务端不一致，请重新同步。");sync(player);return;
         }
-        Point landing = safeLanding(player,verified,request.source(),config.mode.equals("strict"));
+        Point landing = config.safeLanding?safeLanding(player,verified,source,config.mode.equals("strict")):verified;
         if (landing==null) {message(player,"最近的可达位置没有安全落脚点，传送取消。");return;}
+        if(!net.minecraft.world.World.isValid(BlockPos.ofFloored(landing.x(),landing.y(),landing.z()))){message(player,"图中的目标坐标超出世界允许范围。");return;}
         player.stopRiding();
-        player.teleport(world(landing.dimension()),landing.x(),landing.y(),landing.z(),player.getYaw(),player.getPitch());
+        player.teleport(world(landing.dimension()),landing.x(),landing.y(),landing.z(),request.yaw(),request.pitch());
+        if(request.afterTeleport()!=null)request.afterTeleport().accept(player);
         player.fallDistance=0;
         message(player,String.format(Locale.ROOT,"已传送至可达位置 %.2f %.2f %.2f",landing.x(),landing.y(),landing.z()));
     }
@@ -301,8 +463,9 @@ public final class AtpServer implements AutoCloseable {
         ServerWorld world=world(target.dimension()); if(world==null)return null;
         // Load only the chosen destination chunk, never during road detection.
         world.getChunk(BlockPos.ofFloored(target.x(),target.y(),target.z()));
-        for(int offset : new int[]{0,1,-1,2,-2,3,-3,4,-4,8,-8,16,-16}) {
-            double y=Math.floor(target.y())+offset;
+        for(int step=0;step<=config.safeLandingVerticalRange*2;step++) {
+            int offset=step==0?0:((step+1)/2)*(step%2==1?1:-1);
+            double y=step==0?target.y():Math.floor(target.y())+offset;
             Point p=new Point(target.dimension(),target.x(),y,target.z());
             if(strict && Math.abs(y-target.y())>1.5)continue;
             Point reachable=engine().resolve(source,p,false).orElse(null);
@@ -322,122 +485,18 @@ public final class AtpServer implements AutoCloseable {
         if(a==null||b==null||!a.dimension().equals(b.dimension()))return Double.POSITIVE_INFINITY;
         return (a.x()-b.x())*(a.x()-b.x())+(a.y()-b.y())*(a.y()-b.y())+(a.z()-b.z())*(a.z()-b.z());
     }
-    public static Point findPortal(ServerWorld world,BlockPos center) {
-        BlockPos best=null; double distance=Double.POSITIVE_INFINITY;
-        for(BlockPos pos:BlockPos.iterate(center.add(-3,-3,-3),center.add(3,3,3))) {
-            if(!world.isChunkLoaded(pos))continue;
-            var state=world.getBlockState(pos);
-            if(state.isOf(Blocks.NETHER_PORTAL)||state.isOf(Blocks.END_PORTAL)) {
-                double d=pos.getSquaredDistance(center);
-                if(d<distance){best=pos.toImmutable();distance=d;}
-            }
-        }
-        return best==null?null:new Point(world.getRegistryKey().getValue().toString(),best.getX()+.5,best.getY(),best.getZ()+.5);
+    public static Point findPortal(ServerWorld world,BlockPos center){return PortalTracker.findPortal(world,center);}
+    public void recordPortalTravel(Point entrance,Point landing,Point exit){portals.recordTravel(entrance,landing,exit);}
+    public long persistedRevision(){return store.persistedRevision();}
+    public long acceptedRoadProposals(){return acceptedRoadProposals;}
+    public void disconnected(ServerPlayerEntity player){
+        UUID id=player.getUuid();pending.remove(id);outgoing.remove(id);delivered.remove(id);encoding.remove(id);failedSync.remove(id);
+        proposalBudgets.remove(id);lastRequest.remove(id);AtpCommands.disconnected(id);
     }
-    public void recordPortal(Point first,Point second) {
-        first=portalAnchor(first);second=portalAnchor(second);
-        String a=portalKey(first),b=portalKey(second);
-        if(a.compareTo(b)>0){Point swap=first;first=second;second=swap;String s=a;a=b;b=s;}
-        String id="auto:portal:"+UUID.nameUUIDFromBytes((a+"|"+b).getBytes(StandardCharsets.UTF_8));
-        if(entryCount(snapshot())>=config.maxGraphEntries&&snapshot().portals().stream().noneMatch(p->p.id().equals(id)))return;
-        if(editor.putAutoPortal(new PortalLink(id,first,second,false)))schedulePortalChecks();
-    }
-    /** End portals arrive on a platform/spawn instead of another portal block. */
-    public void recordPortalTravel(Point entrance,Point landing,Point exit) {
-        if(exit!=null){recordPortal(entrance,exit);return;}
-        ServerWorld from=world(entrance.dimension());
-        if(from==null||!from.getBlockState(BlockPos.ofFloored(entrance.x(),entrance.y(),entrance.z())).isOf(Blocks.END_PORTAL))return;
-        String id="auto:arrival:"+UUID.nameUUIDFromBytes((portalKey(entrance)+"|"+portalKey(landing)).getBytes(StandardCharsets.UTF_8));
-        if(entryCount(snapshot())>=config.maxGraphEntries&&snapshot().portals().stream().noneMatch(p->p.id().equals(id)))return;
-        editor.putAutoPortal(new PortalLink(id,entrance,landing,false));
-    }
-    private Point portalAnchor(Point point) {
-        ServerWorld world=world(point.dimension());if(world==null)return point;
-        BlockPos pos=BlockPos.ofFloored(point.x(),point.y(),point.z());
-        if(!world.isChunkLoaded(pos)||!world.getBlockState(pos).isOf(Blocks.NETHER_PORTAL))return point;
-        var axis=world.getBlockState(pos).get(net.minecraft.block.NetherPortalBlock.AXIS);
-        for(int i=0;i<21&&world.getBlockState(pos.down()).isOf(Blocks.NETHER_PORTAL);i++)pos=pos.down();
-        var direction=axis==net.minecraft.util.math.Direction.Axis.X?net.minecraft.util.math.Direction.WEST:net.minecraft.util.math.Direction.NORTH;
-        for(int i=0;i<21;i++){
-            BlockPos next=pos.offset(direction);
-            if(!world.isChunkLoaded(next)||!world.getBlockState(next).isOf(Blocks.NETHER_PORTAL))break;
-            pos=next;
-        }
-        return new Point(point.dimension(),pos.getX()+.5,pos.getY(),pos.getZ()+.5);
-    }
-    private void linkExistingPortal(Point entrance) {
-        entrance=portalAnchor(entrance);
-        String cacheKey=portalKey(entrance);
-        if(clock-portalLookups.getOrDefault(cacheKey,-200L)<100)return;
-        Point exit=findExistingExit(entrance);
-        if(exit!=null){
-            // Do not cache a missing exit: POI changes can arrive later in the activation tick.
-            portalLookups.put(cacheKey,clock);
-            if(portalLookups.size()>4096)portalLookups.entrySet().removeIf(e->clock-e.getValue()>100);
-            recordPortal(entrance,exit);
-        }
-    }
-    private Point findExistingExit(Point entrance) {
-        ServerWorld from=world(entrance.dimension());
-        if(from==null)return null;
-        var key=from.getRegistryKey();
-        if(!key.equals(net.minecraft.world.World.OVERWORLD)&&!key.equals(net.minecraft.world.World.NETHER))return null;
-        BlockPos source=BlockPos.ofFloored(entrance.x(),entrance.y(),entrance.z());
-        from.getChunk(source);
-        if(!from.getBlockState(source).isOf(Blocks.NETHER_PORTAL))return null;
-        ServerWorld destination=server.getWorld(key.equals(net.minecraft.world.World.NETHER)?net.minecraft.world.World.OVERWORLD:net.minecraft.world.World.NETHER);
-        if(destination==null)return null;
-        double scale=net.minecraft.world.dimension.DimensionType.getCoordinateScaleFactor(from.getDimension(),destination.getDimension());
-        BlockPos target=destination.getWorldBorder().clamp(entrance.x()*scale,entrance.y(),entrance.z()*scale);
-        var rectangle=destination.getPortalForcer().getPortalRect(target,destination.getRegistryKey().equals(net.minecraft.world.World.NETHER),destination.getWorldBorder());
-        if(rectangle.isPresent()){
-            BlockPos exit=rectangle.get().lowerLeft;
-            return portalAnchor(new Point(destination.getRegistryKey().getValue().toString(),exit.getX()+.5,exit.getY(),exit.getZ()+.5));
-        }
-        return null;
-    }
-    private void schedulePortalChecks() {
-        for(PortalLink portal:snapshot().portals())
-            if(!portal.protectedEntry()&&portal.id().startsWith("auto:portal:")
-                    && !portal.first().dimension().equals(portal.second().dimension())
-                    && Set.of("minecraft:overworld","minecraft:the_nether").contains(portal.first().dimension())
-                    && Set.of("minecraft:overworld","minecraft:the_nether").contains(portal.second().dimension()))
-                portalChecks.add(portal.id());
-    }
-    private void recheckOnePortal() {
-        if(portalChecks.isEmpty())return;
-        String id=portalChecks.iterator().next();portalChecks.remove(id);
-        PortalLink link=snapshot().portals().stream().filter(p->p.id().equals(id)).findFirst().orElse(null);
-        if(link==null||link.protectedEntry())return;
-        Point fromFirst=findExistingExit(link.first()),fromSecond=findExistingExit(link.second());
-        // An undirected graph may retain a genuinely one-way vanilla connection.
-        if(distanceSquared(fromFirst,link.second())>1e-6&&distanceSquared(fromSecond,link.first())>1e-6)
-            editor.removeAutoPortal(id);
-        if(fromFirst!=null)recordPortal(link.first(),fromFirst);
-        if(fromSecond!=null)recordPortal(link.second(),fromSecond);
-    }
-    private String portalKey(Point p){return p.dimension()+":"+(int)Math.floor(p.x())+":"+(int)Math.floor(p.y())+":"+(int)Math.floor(p.z());}
-    private void invalidatePortals(Change change) {
-        for(var portal:List.copyOf(snapshot().portals())) {
-            if(portal.protectedEntry())continue;
-            for(Point endpoint:List.of(portal.first(),portal.second())) {
-                if(portal.id().startsWith("auto:arrival:")&&endpoint==portal.second())continue;
-                if(!endpoint.dimension().equals(change.dimension()))continue;
-                BlockPos pos=BlockPos.ofFloored(endpoint.x(),endpoint.y(),endpoint.z());
-                if(pos.getSquaredDistance(change.pos())>36)continue;
-                ServerWorld world=world(endpoint.dimension());
-                if(world!=null && world.isChunkLoaded(pos)) {
-                    var state=world.getBlockState(pos);
-                    if(!state.isOf(Blocks.NETHER_PORTAL)&&!state.isOf(Blocks.END_PORTAL)
-                            &&editor.removeAutoPortal(portal.id()))schedulePortalChecks();
-                }
-            }
-        }
-    }
-    public void disconnected(ServerPlayerEntity player){pending.remove(player.getUuid());outgoing.remove(player.getUuid());delivered.remove(player.getUuid());lastClientChange.remove(player.getUuid());lastRequest.remove(player.getUuid());AtpCommands.disconnected(player.getUuid());}
     private static CommandSyntaxException error(String text){return new SimpleCommandExceptionType(Text.literal("[ATP] "+text)).create();}
     public static void message(ServerPlayerEntity player,String text){player.sendMessage(Text.literal("[ATP] "+text),false);}
     @Override public void close() throws Exception {
-        try {store.save(snapshot());} finally {SERVERS.remove(server);store.close();}
+        SERVERS.remove(server);syncWorker.shutdownNow();
+        try{store.submit(snapshot());}finally{store.close();}
     }
 }

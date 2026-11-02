@@ -71,7 +71,7 @@ public final class GraphEditor {
 
     public synchronized void registerPortal(PortalLink portal) {
         apiId(portal.id());
-        PortalLink protectedPortal = new PortalLink(portal.id(), portal.first(), portal.second(), true);
+        PortalLink protectedPortal = new PortalLink(portal.id(), portal.first(), portal.second(), true, portal.firstExtent(), portal.secondExtent());
         commit(current.cities(), current.roads(), current.stations(), upsert(current.portals(), protectedPortal, PortalLink::id));
     }
 
@@ -79,7 +79,7 @@ public final class GraphEditor {
     public synchronized boolean putAutoPortal(PortalLink portal) {
         automaticId(portal.id());
         if (current.portals().stream().anyMatch(old -> old.id().equals(portal.id()) && old.protectedEntry())) return false;
-        PortalLink automatic = new PortalLink(portal.id(), portal.first(), portal.second(), false);
+        PortalLink automatic = new PortalLink(portal.id(), portal.first(), portal.second(), false, portal.firstExtent(), portal.secondExtent());
         return commit(current.cities(), current.roads(), current.stations(), upsert(current.portals(), automatic, PortalLink::id));
     }
 

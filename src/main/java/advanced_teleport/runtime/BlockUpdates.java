@@ -19,7 +19,7 @@ public final class BlockUpdates {
             if (listener != null) listener.changed(world, pos.toImmutable());
         } else if (world.getServer() != null) {
             AtpServer service = AtpServer.get(world.getServer());
-            if (service != null) service.enqueue(world.getRegistryKey().getValue().toString(), pos);
+            if (service != null) service.blockChanged(world.getRegistryKey().getValue().toString(), pos);
         }
     }
 

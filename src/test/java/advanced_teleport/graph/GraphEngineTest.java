@@ -83,6 +83,33 @@ class GraphEngineTest {
         assertPoint(n(10,0), engine.resolve(p(1,0),n(50,0),false).orElseThrow());
     }
 
+    @Test void roadBesideFarEdgeOfWidePortalConnectsToItsWholeSurface() {
+        var portal=new PortalLink("wide",p(.5,0),n(0,0),false,
+                new Point(OVERWORLD,19.5,80,0),n(0,0));
+        var graph=engine(List.of(),List.of(road("beside",p(19.5,2),p(19.5,10)),
+                road("destination",n(0,0),n(10,0))),List.of(),List.of(portal));
+        assertPoint(n(10,0),graph.resolve(p(19.5,2),n(10,0),false).orElseThrow());
+    }
+
+    @Test void roadThroughPortalFaceConnectsWithoutPassingNearAnEdgeOrAnchor() {
+        var portal=new PortalLink("wide",p(0,0),n(0,0),false,
+                new Point(OVERWORLD,20,84,0),n(0,0));
+        var crossing=road("through",new Point(OVERWORLD,10,74,-10),new Point(OVERWORLD,10,74,10));
+        var graph=engine(List.of(),List.of(crossing,road("destination",n(0,0),n(10,0))),
+                List.of(),List.of(portal));
+        assertPoint(n(10,0),graph.resolve(crossing.points().get(0),n(10,0),false).orElseThrow());
+    }
+
+    @Test void legacyPortalConstructionAndMissingExtentsRemainPointSurfaces() {
+        var legacy=new PortalLink("old",p(1,2),n(3,4),false);
+        var missing=new PortalLink("old",p(1,2),n(3,4),false,null,null);
+        assertEquals(legacy,missing);
+        assertEquals(legacy.first(),legacy.firstExtent());
+        assertEquals(legacy.second(),legacy.secondExtent());
+        assertThrows(IllegalArgumentException.class,()->new PortalLink("dimension",p(0,0),n(0,0),false,n(2,0),n(0,0)));
+        assertThrows(IllegalArgumentException.class,()->new PortalLink("box",p(0,0),n(0,0),false,new Point(OVERWORLD,1,65,1),n(0,0)));
+    }
+
     @Test void missingPortalPairDoesNotCompareCoordinatesAcrossDimensions() {
         var engine = engine(List.of(), List.of(road("a",p(0,0),p(10,0)), road("b",n(0,0),n(10,0))),
                 List.of(), List.of());
@@ -105,6 +132,59 @@ class GraphEngineTest {
         var engine = engine(List.of(), List.of(road("r",p(0,0),p(100,0))),
                 List.of(new Station("a","r",p(0,0),true),new Station("b","r",p(100,0),true)), List.of());
         assertPoint(p(100,0),engine.resolve(p(0,0),p(90,0),true).orElseThrow());
+    }
+
+    @Test void crossDimensionStrictStationChoiceUsesPortalDistanceInsteadOfIds() {
+        var roads=List.of(road("origin",p(0,0),p(100,0)),road("destination",n(0,0),n(100,0)));
+        var portals=List.of(new PortalLink("portal",p(100,0),n(0,0),false));
+        var first=engine(List.of(),roads,List.of(new Station("a_far","origin",p(0,0),true),
+                new Station("z_near","origin",p(100,0),true)),portals);
+        var renamed=engine(List.of(),roads,List.of(new Station("z_far","origin",p(0,0),true),
+                new Station("a_near","origin",p(100,0),true)),portals);
+        assertPoint(p(100,0),first.resolve(p(0,0),n(90,0),true).orElseThrow());
+        assertPoint(p(100,0),renamed.resolve(p(0,0),n(90,0),true).orElseThrow());
+    }
+
+    @Test void crossDimensionStrictDistanceCanTraverseMoreThanOnePortalPair() {
+        String end="minecraft:the_end";
+        Point e0=new Point(end,0,64,0),e90=new Point(end,90,64,0);
+        var roads=List.of(road("origin",p(0,0),p(100,0)),road("middle",n(0,0),n(20,0)),road("end",e0,e90));
+        var portals=List.of(new PortalLink("first",p(100,0),n(0,0),false),
+                new PortalLink("second",n(20,0),e0,false));
+        var graph=engine(List.of(),roads,List.of(new Station("a_far","origin",p(0,0),true),
+                new Station("z_near","origin",p(100,0),true)),portals);
+        assertPoint(p(100,0),graph.resolve(p(0,0),e90,true).orElseThrow());
+    }
+
+    @Test void strictPortalMetricDoesNotUseAnEndpointWithoutAConnectedRoad() {
+        var roads=List.of(road("origin",p(0,0),p(100,0)),road("destination",n(0,0),n(100,0)));
+        var portals=List.of(new PortalLink("valid",p(100,0),n(0,0),false),
+                new PortalLink("unserved",p(0,5),n(90,0),false));
+        var graph=engine(List.of(),roads,List.of(new Station("far","origin",p(0,0),true),
+                new Station("near","origin",p(100,0),true)),portals);
+        assertPoint(p(100,0),graph.resolve(p(0,0),n(90,0),true).orElseThrow());
+    }
+
+    @Test void reachableGeometryViewsExcludeDisconnectedCitiesAndRoads() {
+        var portal=new PortalLink("portal",p(10,0),n(0,0),false);
+        var graph=engine(List.of(city("home",-1,-1,11,1),city("elsewhere",50,50,60,60)),
+                List.of(road("origin",p(0,0),p(10,0)),road("destination",n(0,0),n(10,0)),road("separate",p(25,0),p(35,0))),
+                List.of(new Station("station","origin",p(0,0),true)),List.of(portal));
+        assertEquals(List.of("origin","destination"),graph.reachableRoads(p(0,0),true).stream().map(Road::id).toList());
+        assertEquals(List.of("home"),graph.reachableCities(p(0,0),false).stream().map(City::id).toList());
+        assertEquals(List.of(portal),graph.reachablePortals(p(0,0),true));
+        assertTrue(graph.reachableRoads(p(25,50),false).isEmpty());
+    }
+
+    @Test void rectangleDistanceHandlesFacesEdgesHorizontalSurfacesAndDegeneratePoints() {
+        Point low=new Point(OVERWORLD,0,0,0),high=new Point(OVERWORLD,10,10,0);
+        assertEquals(0,Geometry.segmentRectangleDistanceSquared(new Point(OVERWORLD,5,5,-2),new Point(OVERWORLD,5,5,2),low,high),1e-9);
+        assertEquals(4,Geometry.segmentRectangleDistanceSquared(new Point(OVERWORLD,-5,5,2),new Point(OVERWORLD,15,5,2),low,high),1e-9);
+        assertEquals(3,Geometry.segmentRectangleDistanceSquared(new Point(OVERWORLD,-2,-2,1),new Point(OVERWORLD,-1,-1,1),low,high),1e-9);
+        assertPoint(p(5,5),Geometry.closestOnRectangle(new Point(OVERWORLD,5,70,5),p(10,10),p(0,0)));
+        assertEquals(36,Geometry.rectangleDistanceSquared(p(0,0),p(10,10),new Point(OVERWORLD,5,70,5),new Point(OVERWORLD,15,70,15)),1e-9);
+        assertEquals(25,Geometry.segmentRectangleDistanceSquared(p(0,0),p(10,0),p(5,5),p(5,5)),1e-9);
+        assertEquals(Double.POSITIVE_INFINITY,Geometry.segmentRectangleDistanceSquared(p(0,0),p(10,0),n(0,0),n(10,0)));
     }
 
     @Test void strictDeniesTargetOutsideEveryRegion() {

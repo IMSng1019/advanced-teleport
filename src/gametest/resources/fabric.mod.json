@@ -5,7 +5,11 @@
   "name": "Advanced Teleport integration tests",
   "environment": "server",
   "entrypoints": {
-    "fabric-gametest": ["advanced_teleport.gametest.AdvancedTeleportGameTests"]
+    "fabric-gametest": [
+      "advanced_teleport.gametest.AdvancedTeleportGameTests",
+      "advanced_teleport.gametest.RuntimeRegressionGameTests",
+      "advanced_teleport.gametest.PortalRegressionGameTests"
+    ]
   },
   "depends": {
     "advanced_teleport": "*",
