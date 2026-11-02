@@ -1,0 +1,38 @@
+{
+	"schemaVersion": 1,
+	"id": "advanced_teleport",
+	"version": "${version}",
+	"name": "advanced_teleport",
+	"description": "This is an example description! Tell everyone what your mod is about!",
+	"authors": [
+		"Me!"
+	],
+	"contact": {
+		"homepage": "https://fabricmc.net/",
+		"sources": "https://github.com/FabricMC/fabric-example-mod"
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/advanced_teleport/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"advanced_teleport.modid.Advanced_teleport"
+		],
+		"client": [
+			"advanced_teleport.modid.client.Advanced_teleportClient"
+		]
+	},
+	"mixins": [
+		"advanced_teleport.mixins.json",
+		{
+			"config": "advanced_teleport.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.20.1",
+		"minecraft": "~1.20.4",
+		"java": ">=17",
+		"fabric-api": "*"
+	}
+}
