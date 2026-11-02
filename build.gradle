@@ -4,6 +4,7 @@ plugins {
 }
 
 repositories {
+	mavenCentral()
 	// Add repositories to retrieve artifacts from in here.
 	// You should only use this when depending on other mods because
 	// Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
@@ -22,6 +23,29 @@ loom {
 	}
 }
 
+sourceSets {
+	gametest {
+		compileClasspath += sourceSets.main.compileClasspath + sourceSets.main.output
+		runtimeClasspath += sourceSets.main.runtimeClasspath + sourceSets.main.output
+	}
+}
+
+loom {
+	mods {
+		advanced_teleport_test { sourceSet sourceSets.gametest }
+	}
+	runs {
+		gametest {
+			server()
+			name 'ATP GameTests'
+			source sourceSets.gametest
+			vmArg '-Dfabric-api.gametest'
+			vmArg "-Dfabric-api.gametest.report-file=${project.layout.buildDirectory.file('gametest-results.xml').get().asFile.absolutePath}"
+			runDir 'build/gametest'
+		}
+	}
+}
+
 dependencies {
 	// To change the versions see the gradle.properties file
 	minecraft "com.mojang:minecraft:${project.minecraft_version}"
@@ -30,6 +54,14 @@ dependencies {
 
 	// Fabric API. This is technically optional, but you probably want it anyway.
 	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+	implementation include('org.xerial:sqlite-jdbc:3.49.1.0')
+	testImplementation platform('org.junit:junit-bom:5.12.2')
+	testImplementation 'org.junit.jupiter:junit-jupiter'
+	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+	useJUnitPlatform()
 }
 
 processResources {
@@ -43,6 +75,7 @@ processResources {
 
 tasks.withType(JavaCompile).configureEach {
 	it.options.release = 17
+	it.options.encoding = 'UTF-8'
 }
 
 java {

@@ -3,7 +3,9 @@
 	"package": "advanced_teleport.modid.mixin",
 	"compatibilityLevel": "JAVA_17",
 	"mixins": [
-		"ExampleMixin"
+		"TeleportCommandMixin",
+		"WorldChunkMixin",
+		"ServerPlayerPortalMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

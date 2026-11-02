@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "advanced_teleport_test",
+  "version": "1.0.0",
+  "name": "Advanced Teleport integration tests",
+  "environment": "server",
+  "entrypoints": {
+    "fabric-gametest": ["advanced_teleport.gametest.AdvancedTeleportGameTests"]
+  },
+  "depends": {
+    "advanced_teleport": "*",
+    "fabric-gametest-api-v1": "*"
+  }
+}
