@@ -3,10 +3,15 @@ package advanced_teleport.detection;
 import advanced_teleport.graph.GraphData.RoadKind;
 import advanced_teleport.graph.GraphData.Road;
 import advanced_teleport.graph.GraphData.Point;
+import advanced_teleport.graph.GraphData.Snapshot;
+import advanced_teleport.graph.GraphEngine;
+import advanced_teleport.graph.GraphSettings;
 import org.junit.jupiter.api.Test;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 import static advanced_teleport.detection.RoadDetector.*;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -135,6 +140,80 @@ class RoadDetectorTest {
         assertTrue(result.roads().stream().anyMatch(r->r.kind()==RoadKind.ICE && r.points().size()==3));
     }
 
+    @Test void guardedIceCrossroadsConnectEveryArmAtThreeAndFiveBlocksWide() {
+        for(int width:new int[]{3,5}) assertJunctionConnected(iceJunction(width,15),width,15);
+    }
+
+    @Test void guardedIceTJunctionsConnectEveryArmInEveryOrientation() {
+        for(int width:new int[]{3,5}) for(int closed=0;closed<4;closed++) {
+            int arms=15^(1<<closed);
+            assertJunctionConnected(iceJunction(width,arms),width,arms);
+        }
+    }
+
+    @Test void guardedIceLCornersRemainConnectedInEveryOrientation() {
+        for(int width:new int[]{3,5}) for(int direction=0;direction<4;direction++) {
+            int arms=(1<<direction)|(1<<((direction+1)%4));
+            assertJunctionConnected(iceJunction(width,arms),width,arms);
+        }
+    }
+
+    @Test void iceJunctionsRejectMissingWallsBrokenFloorsAndBlockedHeadroom() {
+        for(int width:new int[]{3,5}) {
+            Grid missingWall=iceJunction(width,14); // North is closed; its whole side needs a wall.
+            missingWall.put(width/2,65,-1,BlockSample.AIR);
+            assertJunctionDisconnected(missingWall,width,"A hole in the closed side must not become another road arm");
+
+            Grid missingArmWall=iceJunction(width,15);
+            missingArmWall.put(-1,65,-1,BlockSample.AIR);
+            assertJunctionDisconnected(missingArmWall,width,"An open arm must still have both guardrails");
+
+            Grid brokenFloor=iceJunction(width,15);
+            brokenFloor.put(width/2,64,width/2,BlockSample.AIR);
+            assertJunctionDisconnected(brokenFloor,width,"A junction needs its complete blue-ice floor");
+
+            Grid blockedHeadroom=iceJunction(width,15);
+            blockedHeadroom.put(width/2,66,width/2,BlockSample.SOLID);
+            assertJunctionDisconnected(blockedHeadroom,width,"A junction needs two clear blocks above its floor");
+        }
+    }
+
+    @Test void junctionRemovalReexaminesEveryConnectionAndRejectsStaleUploads() {
+        for(int width:new int[]{3,5}) {
+            Grid grid=iceJunction(width,15);
+            var before=scan(grid,DIM,new Cell(width/2,64,width/2),SETTINGS);
+            List<Road> connections=before.roads().stream().filter(r->r.points().size()==3).toList();
+            assertFalse(connections.isEmpty(),"The crossroads must first contain connecting segments");
+            assertEquals(Set.copyOf(connections),Set.copyOf(validateCandidates(grid,DIM,connections,SETTINGS)),
+                    "Server validation must accept the same geometry as the client scan");
+
+            // A far arm guardrail is at the edge of the junction's dependency footprint.
+            Cell removed=new Cell(width,65,width);
+            grid.put(removed.x(),removed.y(),removed.z(),BlockSample.AIR);
+            var after=scan(grid,DIM,removed,SETTINGS);
+            Set<String> ids=connections.stream().map(Road::id).collect(Collectors.toSet());
+            assertTrue(after.examinedIds().containsAll(ids),"The edit scan must revisit every old junction connection");
+            assertTrue(after.roads().stream().noneMatch(r->ids.contains(r.id())));
+            var checked=validateExistingCandidates(grid,DIM,connections,SETTINGS);
+            assertEquals(ids,checked.rejectedIds());
+            assertTrue(validateCandidates(grid,DIM,connections,SETTINGS).isEmpty());
+        }
+    }
+
+    @Test void unloadedJunctionArmDoesNotAuthorizeDeletingItsExistingConnections() {
+        Grid grid=iceJunction(5,15);
+        List<Road> connections=scan(grid,DIM,new Cell(2,64,2),SETTINGS).roads().stream()
+                .filter(r->r.points().size()==3).toList();
+        assertFalse(connections.isEmpty());
+        BlockSource unloaded=(x,y,z)->x>=5?BlockSample.UNLOADED:grid.blockAt(x,y,z);
+        var after=scan(unloaded,DIM,new Cell(2,64,2),SETTINGS);
+        assertFalse(after.complete());
+        assertTrue(connections.stream().noneMatch(r->after.examinedIds().contains(r.id())));
+        var checked=validateExistingCandidates(unloaded,DIM,connections,SETTINGS);
+        assertEquals(connections.stream().map(Road::id).collect(Collectors.toSet()),checked.unknownIds());
+        assertTrue(checked.rejectedIds().isEmpty());
+    }
+
     @Test void ordinaryRailCornersAndTheirApproachesStayConnected() {
         Grid grid=pairedBend(2);
         var result=scan(grid,DIM,new Cell(0,64,0),SETTINGS);
@@ -226,5 +305,51 @@ class RoadDetectorTest {
             grid.put(x,65,-1,BlockSample.SOLID);grid.put(x,65,width,BlockSample.SOLID);
         }
         return grid;
+    }
+
+    /** Bit order is north, east, south, west; walls follow the exterior of the entire ice floor. */
+    private static Grid iceJunction(int width,int arms) {
+        Grid grid=new Grid();
+        for(int x=-12;x<width+12;x++) for(int z=-12;z<width+12;z++) {
+            boolean withinX=x>=0&&x<width,withinZ=z>=0&&z<width;
+            if(withinX&&withinZ || withinX&&(z<0&&(arms&1)!=0 || z>=width&&(arms&4)!=0)
+                    || withinZ&&(x<0&&(arms&8)!=0 || x>=width&&(arms&2)!=0))
+                grid.put(x,64,z,BlockSample.BLUE_ICE);
+        }
+        for(Cell floor:List.copyOf(grid.blocks.keySet())) for(int[] direction:new int[][]{{0,-1},{1,0},{0,1},{-1,0}}) {
+            Cell beside=floor.add(direction[0],0,direction[1]);
+            if(grid.blockAt(beside.x(),beside.y(),beside.z()).kind()!=Kind.BLUE_ICE)
+                grid.put(beside.x(),65,beside.z(),BlockSample.SOLID);
+        }
+        return grid;
+    }
+
+    private static Point armPoint(int width,int direction) {
+        return switch(direction) {
+            case 0->new Point(DIM,width/2.0,65,-3.5);
+            case 1->new Point(DIM,width+3.5,65,width/2.0);
+            case 2->new Point(DIM,width/2.0,65,width+3.5);
+            case 3->new Point(DIM,-3.5,65,width/2.0);
+            default->throw new IllegalArgumentException("Invalid fixture arm");
+        };
+    }
+
+    private static GraphEngine junctionGraph(Grid grid,int width) {
+        var roads=scan(grid,DIM,new Cell(width/2,64,width/2),SETTINGS).roads();
+        return new GraphEngine(new Snapshot(1,List.of(),roads,List.of(),List.of()),new GraphSettings(2,3,2,3));
+    }
+
+    private static void assertJunctionConnected(Grid grid,int width,int arms) {
+        GraphEngine graph=junctionGraph(grid,width);
+        for(int from=0;from<4;from++) for(int to=0;to<4;to++) if((arms&(1<<from))!=0&&(arms&(1<<to))!=0) {
+            Point target=armPoint(width,to);
+            assertEquals(target,graph.resolve(armPoint(width,from),target,false).orElseThrow(),
+                    "width="+width+", arms="+arms+", from="+from+", to="+to);
+        }
+    }
+
+    private static void assertJunctionDisconnected(Grid grid,int width,String message) {
+        Point target=armPoint(width,1);
+        assertNotEquals(target,junctionGraph(grid,width).resolve(armPoint(width,3),target,false).orElseThrow(),message);
     }
 }

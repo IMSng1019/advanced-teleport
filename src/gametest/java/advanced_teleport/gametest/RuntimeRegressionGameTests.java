@@ -15,8 +15,14 @@ import io.netty.channel.embedded.EmbeddedChannel;
 import net.fabricmc.fabric.api.gametest.v1.FabricGameTest;
 import net.fabricmc.fabric.api.networking.v1.PacketByteBufs;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.block.BedBlock;
+import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.enums.BedPart;
 import net.minecraft.command.argument.EntityAnchorArgumentType;
+import net.minecraft.entity.EquipmentSlot;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
 import net.minecraft.network.ClientConnection;
 import net.minecraft.network.NetworkSide;
 import net.minecraft.network.NetworkState;
@@ -34,9 +40,12 @@ import net.minecraft.test.GameTest;
 import net.minecraft.test.TestContext;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.Vec3d;
 
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
@@ -101,6 +110,115 @@ public final class RuntimeRegressionGameTests implements FabricGameTest {
         } finally {
             AdvancedTeleportApi.unregister(server,"city",prefix+"city");
             AdvancedTeleportApi.unregister(server,"city",prefix+"unrelated");
+            original.save(Advanced_teleport.DATA_ROOT.resolve("config.json"));service.reload();
+        }
+        context.complete();
+    }
+
+    @GameTest(templateName=EMPTY_STRUCTURE,tickLimit=60,batchId="atp_runtime_tp_sleep")
+    public void ordinaryTpWakesSleepingPlayerWithoutReturningToOldBed(TestContext context) throws Exception {
+        ServerWorld world=context.getWorld();
+        MinecraftServer server=world.getServer();
+        AtpServer service=AtpServer.get(server);
+        AtpConfig original=service.config();
+        String dimension=world.getRegistryKey().getValue().toString();
+        String cityId="atp-sleep:"+UUID.randomUUID();
+        BlockPos foot=new BlockPos(18001,100,18001),head=foot.east();
+        var previousBlocks=new LinkedHashMap<BlockPos,BlockState>();
+        world.getChunk(foot);
+        // Restore the original blocks even when an assertion fails.
+        for(int x=-1;x<=2;x++)for(int z=-1;z<=1;z++)for(int y=-1;y<=2;y++) {
+            BlockPos pos=foot.add(x,y,z);previousBlocks.put(pos,world.getBlockState(pos));
+        }
+        try {
+            AtpConfig active=service.config();active.mode="default";active.safeLanding=false;
+            active.save(Advanced_teleport.DATA_ROOT.resolve("config.json"));service.reload();
+            AdvancedTeleportApi.registerCity(server,rectangle(cityId,dimension,18000,18000,18014,18014));
+            for(BlockPos pos:previousBlocks.keySet())
+                world.setBlockState(pos,pos.getY()<foot.getY()?Blocks.STONE.getDefaultState():Blocks.AIR.getDefaultState(),2);
+            BlockState bed=Blocks.RED_BED.getDefaultState().with(BedBlock.FACING,Direction.EAST);
+            world.setBlockState(foot,bed.with(BedBlock.PART,BedPart.FOOT),2);
+            world.setBlockState(head,bed.with(BedBlock.PART,BedPart.HEAD),2);
+            Point source=new Point(dimension,foot.getX()+.5,foot.getY(),foot.getZ()+.5);
+            Point expected=new Point(dimension,18014,101,18008.5);
+            try(TestClient client=new TestClient(server,world,source)) {
+                try {
+                    client.player.sleep(head);
+                    context.assertTrue(client.player.isSleeping()&&world.getBlockState(head).get(BedBlock.OCCUPIED),
+                            "Fixture did not put the real server player to sleep in the real bed");
+                    Protocol.Sync clientView=copyForClient(service);
+                    server.getCommandManager().getDispatcher().execute(
+                            "tp "+client.player.getUuidAsString()+" 18020.25 101.0 18008.5 137 -23",client.source());
+                    client.answer(client.takeQuery(),clientView);
+                    context.assertFalse(client.player.isSleeping(),"Ordinary TP left the player sleeping in the old bed");
+                    context.assertFalse(world.getBlockState(head).get(BedBlock.OCCUPIED),"Ordinary TP left the old bed occupied");
+                    context.assertTrue(AtpServer.distanceSquared(AtpServer.point(client.player),expected)<1e-8,
+                            "Waking the sleeping player changed the verified TP landing point");
+                    context.assertTrue(Math.abs(MathHelper.wrapDegrees(client.player.getHeadYaw()-137))<1e-4,
+                            "Ordinary TP did not update the sleeping player's head yaw");
+                    client.player.wakeUp(true,true);
+                    context.assertTrue(AtpServer.distanceSquared(AtpServer.point(client.player),expected)<1e-8,
+                            "Leaving sleep after TP returned the player to the old bed");
+                } finally {
+                    if(client.player.isSleeping())client.player.wakeUp(true,true);
+                }
+            }
+        } finally {
+            for(var entry:previousBlocks.entrySet())world.setBlockState(entry.getKey(),entry.getValue(),2);
+            AdvancedTeleportApi.unregister(server,"city",cityId);
+            original.save(Advanced_teleport.DATA_ROOT.resolve("config.json"));service.reload();
+        }
+        context.complete();
+    }
+
+    @GameTest(templateName=EMPTY_STRUCTURE,tickLimit=60,batchId="atp_runtime_tp_falling")
+    public void ordinaryTpStopsVerticalMotionForNonFlyingPlayer(TestContext context) throws Exception {
+        verifyOrdinaryTpMotion(context,false);
+    }
+
+    @GameTest(templateName=EMPTY_STRUCTURE,tickLimit=60,batchId="atp_runtime_tp_elytra")
+    public void ordinaryTpPreservesElytraMotion(TestContext context) throws Exception {
+        verifyOrdinaryTpMotion(context,true);
+    }
+
+    private static void verifyOrdinaryTpMotion(TestContext context,boolean fallFlying) throws Exception {
+        ServerWorld world=context.getWorld();
+        MinecraftServer server=world.getServer();
+        AtpServer service=AtpServer.get(server);
+        AtpConfig original=service.config();
+        String dimension=world.getRegistryKey().getValue().toString();
+        String cityId="atp-motion:"+UUID.randomUUID();
+        Point source=new Point(dimension,19001.5,100.75,19001.5);
+        Point expected=new Point(dimension,19014,100.75,19008.5);
+        Vec3d initialVelocity=new Vec3d(.4,-1.5,.2);
+        try {
+            AtpConfig active=service.config();active.mode="default";active.safeLanding=false;
+            active.save(Advanced_teleport.DATA_ROOT.resolve("config.json"));service.reload();
+            AdvancedTeleportApi.registerCity(server,rectangle(cityId,dimension,19000,19000,19014,19014));
+            try(TestClient client=new TestClient(server,world,source)) {
+                client.player.setOnGround(false);
+                if(fallFlying) {
+                    client.player.equipStack(EquipmentSlot.CHEST,new ItemStack(Items.ELYTRA));
+                    client.player.startFallFlying();
+                }
+                client.player.setVelocity(initialVelocity);
+                context.assertTrue(client.player.isFallFlying()==fallFlying&&!client.player.isOnGround(),
+                        "Fixture did not establish the requested airborne state");
+                Protocol.Sync clientView=copyForClient(service);
+                server.getCommandManager().getDispatcher().execute(
+                        "tp "+client.player.getUuidAsString()+" 19020.25 100.75 19008.5",client.source());
+                client.answer(client.takeQuery(),clientView);
+                context.assertTrue(AtpServer.distanceSquared(AtpServer.point(client.player),expected)<1e-8,
+                        "Motion fixture did not complete the ordinary TP packet round trip");
+                Vec3d expectedVelocity=fallFlying?initialVelocity:new Vec3d(initialVelocity.x,0,initialVelocity.z);
+                context.assertTrue(client.player.getVelocity().squaredDistanceTo(expectedVelocity)<1e-8,
+                        fallFlying?"Ordinary TP reset elytra velocity":"Ordinary TP did not stop vertical motion while preserving horizontal motion");
+                context.assertTrue(client.player.isOnGround()==!fallFlying,
+                        fallFlying?"Ordinary TP grounded an elytra-flying player":"Ordinary TP did not restore the vanilla grounded state");
+                context.assertTrue(client.player.isFallFlying()==fallFlying,"Ordinary TP changed the player's elytra flight state");
+            }
+        } finally {
+            AdvancedTeleportApi.unregister(server,"city",cityId);
             original.save(Advanced_teleport.DATA_ROOT.resolve("config.json"));service.reload();
         }
         context.complete();

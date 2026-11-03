@@ -82,8 +82,10 @@ public final class AtpServer implements AutoCloseable {
 
     public AtpServer(MinecraftServer server, Path root) throws Exception {
         this.server = server;
-        // Display names may repeat (e.g. two "New World" saves); the save folder is unique.
-        worldName=server.getSavePath(net.minecraft.util.WorldSavePath.ROOT).toAbsolutePath().normalize().getFileName().toString();
+        // Keep the complete logical save path: nested worlds may share the same leaf name.
+        Path savesDirectory=server.getRunDirectory().toPath();
+        if(!server.isDedicated())savesDirectory=savesDirectory.resolve("saves");
+        worldName=DataPaths.worldIdentity(savesDirectory,server.getSavePath(net.minecraft.util.WorldSavePath.ROOT));
         configFile = root.resolve("config.json");
         config = AtpConfig.load(configFile);
         String bindAddress=Objects.toString(server.getServerIp(),"");
@@ -453,9 +455,14 @@ public final class AtpServer implements AutoCloseable {
         Point landing = config.safeLanding?safeLanding(player,verified,source,config.mode.equals("strict")):verified;
         if (landing==null) {message(player,"最近的可达位置没有安全落脚点，传送取消。");return;}
         if(!net.minecraft.world.World.isValid(BlockPos.ofFloored(landing.x(),landing.y(),landing.z()))){message(player,"图中的目标坐标超出世界允许范围。");return;}
-        player.stopRiding();
-        player.teleport(world(landing.dimension()),landing.x(),landing.y(),landing.z(),request.yaw(),request.pitch());
+        // Use vanilla command teleport preparation (wake up, chunk ticket and head rotation).
+        // Graph-selected coordinates are absolute, even when the original command was relative.
+        if(!player.teleport(world(landing.dimension()),landing.x(),landing.y(),landing.z(),Set.of(),request.yaw(),request.pitch()))return;
         if(request.afterTeleport()!=null)request.afterTeleport().accept(player);
+        if(!player.isFallFlying()) {
+            player.setVelocity(player.getVelocity().multiply(1,0,1));
+            player.setOnGround(true);
+        }
         player.fallDistance=0;
         message(player,String.format(Locale.ROOT,"已传送至可达位置 %.2f %.2f %.2f",landing.x(),landing.y(),landing.z()));
     }

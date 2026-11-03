@@ -428,7 +428,11 @@ public final class RoadDetector {
                 if(a==null || a.width()!=width) continue;
                 Span b=arm(anchor,width,second);
                 if(b==null || b.width()!=width) continue;
-                if(!guardedSide(anchor,width,first.opposite()) || !guardedSide(anchor,width,second.opposite())) continue;
+                // Keep the same adjacent-arm segments for bends, T-junctions and crossroads.
+                // Every other side must be closed by a complete wall or continue as a
+                // fully guarded, equally wide arm; a missing wall is not itself a road.
+                if(!guardedSideOrArm(anchor,width,first.opposite())
+                        || !guardedSideOrArm(anchor,width,second.opposite())) continue;
                 boolean floor=true;
                 for(int dx=0;dx<width && floor;dx++) for(int dz=0;dz<width;dz++)
                     if(!walkableIce(anchor.add(dx,0,dz))) { floor=false;break; }
@@ -446,6 +450,12 @@ public final class RoadDetector {
                 case WEST->span(base.add(-1,0,0),true);
                 case EAST->span(base.add(width,0,0),true);
             };
+        }
+
+        private boolean guardedSideOrArm(Cell base,int width,Direction direction) {
+            if(guardedSide(base,width,direction))return true;
+            Span continuation=arm(base,width,direction);
+            return continuation!=null&&continuation.width()==width;
         }
 
         private boolean guardedSide(Cell base, int width, Direction direction) {

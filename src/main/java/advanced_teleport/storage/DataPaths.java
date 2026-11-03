@@ -25,6 +25,25 @@ public final class DataPaths {
         return gameDir.toAbsolutePath().normalize().resolve("advanced_teleport");
     }
 
+    /**
+     * Names a save relative to the installation's normal save root, preserving legacy flat names.
+     * Keep nested level-name and custom --universe paths so equal leaf names cannot share a graph.
+     * The caller uses the run directory for dedicated servers and runDirectory/saves for singleplayer.
+     */
+    public static String worldIdentity(Path defaultSavesDirectory, Path worldDirectory) {
+        Path base = Objects.requireNonNull(defaultSavesDirectory, "defaultSavesDirectory").toAbsolutePath().normalize();
+        Path world = Objects.requireNonNull(worldDirectory, "worldDirectory").toAbsolutePath().normalize();
+        Path identity;
+        try {
+            identity = base.relativize(world);
+        } catch (IllegalArgumentException differentRoots) {
+            // Windows worlds on another volume have no relative path; retain the complete identity.
+            identity = world;
+        }
+        String name = identity.toString();
+        return name.isEmpty() ? "." : name.replace(identity.getFileSystem().getSeparator(), "/");
+    }
+
     public static Path worldDirectory(Path root, String endpoint, String worldName) {
         Objects.requireNonNull(root, "root");
         Objects.requireNonNull(endpoint, "endpoint");
